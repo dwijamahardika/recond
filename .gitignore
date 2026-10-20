@@ -1,0 +1,22 @@
+# build and test output
+bin/
+cover.out
+*.exe
+*.prof
+
+# local configuration (only the example is versioned)
+.env
+.env.*
+!.env.example
+
+# databases
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# generated data, reports and benchmark output
+data/
+reports/
+demo-out/
+bench-out/

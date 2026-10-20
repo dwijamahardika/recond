@@ -1,0 +1,34 @@
+{
+  "_note": "Example rules for the fictional providers psp_a and bank_b used by the generator, tests and demo. Fee rates, settlement terms and file formats are illustrative only and do not describe any real provider.",
+  "batch_search_budget": 2000000,
+  "providers": [
+    {
+      "name": "psp_a",
+      "format": "psp_a",
+      "timezone": "+00:00",
+      "settlement_days": 2,
+      "match_window": "10m",
+      "amount_tolerance_minor": 0,
+      "fee_tolerance_minor": 1,
+      "batch_tolerance_minor": 0,
+      "max_batch_exclusions": 3,
+      "fees": {
+        "IDR": { "rate_bps": 150, "fixed_minor": 0, "rounding": "half_up" }
+      }
+    },
+    {
+      "name": "bank_b",
+      "format": "bank_b",
+      "timezone": "+07:00",
+      "settlement_days": 1,
+      "match_window": "10m",
+      "amount_tolerance_minor": 0,
+      "fee_tolerance_minor": 0,
+      "batch_tolerance_minor": 0,
+      "max_batch_exclusions": 3,
+      "fees": {
+        "IDR": { "rate_bps": 90, "fixed_minor": 20000, "rounding": "half_up" }
+      }
+    }
+  ]
+}

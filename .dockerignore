@@ -1,0 +1,10 @@
+.git
+bin/
+demo-out/
+bench-out/
+data/
+reports/
+*.db
+*.db-*
+.env
+.env.*
