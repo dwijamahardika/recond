@@ -46,8 +46,10 @@ type Config struct {
 }
 
 // DefaultWindowedRuns is the feature flag's value when RECOND_WINDOWED_RUNS
-// is unset (docs/lifecycle/windowed-runs/05-rollout-plan.md).
-const DefaultWindowedRuns = false
+// is unset. On since the launch rehearsal (stage 4 of
+// docs/lifecycle/windowed-runs/05-rollout-plan.md); RECOND_WINDOWED_RUNS=off
+// stays the kill switch until the cleanup criteria in 08-cleanup.md are met.
+const DefaultWindowedRuns = true
 
 // WindowedRuns reads the RECOND_WINDOWED_RUNS feature flag: on/off,
 // true/false, 1/0; unset means DefaultWindowedRuns. Anything else is an

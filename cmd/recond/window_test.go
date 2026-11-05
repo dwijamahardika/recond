@@ -49,9 +49,13 @@ func TestCLIWindowedRun(t *testing.T) {
 	if out := must("runs"); strings.Contains(out, "WINDOW") {
 		t.Fatalf("full-history runs list exactly as before:\n%s", out)
 	}
-	t.Setenv("RECOND_WINDOWED_RUNS", "")
+	t.Setenv("RECOND_WINDOWED_RUNS", "off")
 	if _, err := sh("run", "-from", "2026-10-01", "-to", "2026-10-02"); err == nil || !strings.Contains(err.Error(), "RECOND_WINDOWED_RUNS") {
 		t.Fatalf("flag off: %v", err)
+	}
+	t.Setenv("RECOND_WINDOWED_RUNS", "")
+	if out := must("migrations"); !strings.Contains(out, map[bool]string{true: "windowed runs: enabled", false: "windowed runs: disabled"}[config.DefaultWindowedRuns]) {
+		t.Fatalf("unset must follow config.DefaultWindowedRuns:\n%s", out)
 	}
 	t.Setenv("RECOND_WINDOWED_RUNS", "on")
 	for args, want := range map[string]string{
