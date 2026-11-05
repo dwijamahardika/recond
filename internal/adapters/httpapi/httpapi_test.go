@@ -36,7 +36,7 @@ type env struct {
 	clk *clock.Fake
 }
 
-func setup(t *testing.T) *env {
+func setup(t *testing.T, opts ...app.Option) *env {
 	t.Helper()
 	rules, err := config.LoadRules("")
 	if err != nil {
@@ -51,7 +51,7 @@ func setup(t *testing.T) *env {
 	m := httpapi.NewMetrics(reg)
 	clk := clock.NewFake(now)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := app.NewService(store, rules, clk, log, m)
+	svc := app.NewService(store, rules, clk, log, m, opts...)
 	h := httpapi.NewHandler(httpapi.Deps{
 		Service: svc, Metrics: m, Registry: reg, Logger: log, Clock: clk,
 		APIKeys:        map[string]string{apiKey: "ops-team"},

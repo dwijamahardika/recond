@@ -43,7 +43,8 @@ func cmdServe(ctx context.Context, args []string) error {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	metrics := httpapi.NewMetrics(reg)
-	svc := app.NewService(store, cfg.Rules, clock.System{}, log, metrics)
+	svc := app.NewService(store, cfg.Rules, clock.System{}, log, metrics, app.WithWindowedRuns(cfg.WindowedRuns))
+	log.Info("feature flags", "windowed_runs", cfg.WindowedRuns)
 	if counts, err := store.ExceptionCounts(ctx); err == nil {
 		metrics.ExceptionsOpen(counts[sqlite.StatusOpen])
 	}

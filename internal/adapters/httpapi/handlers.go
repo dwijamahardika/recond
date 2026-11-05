@@ -12,6 +12,7 @@ import (
 	"github.com/dwijamahardika/recond/internal/adapters/sqlite"
 	"github.com/dwijamahardika/recond/internal/app"
 	"github.com/dwijamahardika/recond/internal/domain"
+	"github.com/dwijamahardika/recond/internal/match"
 )
 
 func (h *handlers) webhook(w http.ResponseWriter, r *http.Request) {
@@ -75,6 +76,9 @@ func (h *handlers) payment(w http.ResponseWriter, r *http.Request) {
 
 type runRequest struct {
 	AsOf *time.Time `json:"as_of"`
+	// Window restricts the run to business dates; omitted or zero margins
+	// mean the default. Needs RECOND_WINDOWED_RUNS=on.
+	Window *match.Window `json:"window"`
 }
 
 func (h *handlers) createRun(w http.ResponseWriter, r *http.Request) {
@@ -87,6 +91,10 @@ func (h *handlers) createRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.Window != nil && !h.Service.WindowedRunsEnabled() {
+		writeProblem(w, r, http.StatusBadRequest, "Windowed runs disabled", "This server does not accept a window. Set RECOND_WINDOWED_RUNS=on to enable it.")
+		return
+	}
 	if !h.runMu.TryLock() {
 		w.Header().Set("Retry-After", "10")
 		writeProblem(w, r, http.StatusConflict, "Run in progress", "Another reconciliation run is in progress.")
@@ -95,12 +103,19 @@ func (h *handlers) createRun(w http.ResponseWriter, r *http.Request) {
 	defer h.runMu.Unlock()
 	// A large run outlives the default write timeout.
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(15 * time.Minute))
-	opt := app.RunOptions{}
+	opt := app.RunOptions{Window: req.Window}
 	if req.AsOf != nil {
 		opt.AsOf = *req.AsOf
 	}
 	sum, err := h.Service.Run(r.Context(), opt)
-	if err != nil {
+	switch {
+	case errors.Is(err, app.ErrValidation):
+		writeProblem(w, r, http.StatusBadRequest, "Invalid window", err.Error())
+		return
+	case errors.Is(err, app.ErrWindowedRunsDisabled):
+		writeProblem(w, r, http.StatusBadRequest, "Windowed runs disabled", err.Error())
+		return
+	case err != nil:
 		internal(w, r, err)
 		return
 	}
