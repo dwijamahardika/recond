@@ -651,19 +651,26 @@ func deferDetail(w *WindowResult, c counterpart, more []counterpart, attached, w
 }
 
 // attach appends a counterpart from outside the visible range to the
-// engine's input and makes it a member of o. The input slices are re-sliced
-// to their length first, so an append can never write into a caller's
-// array. Attached records are not in the passes' sort orders, so no pass
-// sees them.
+// engine's input and makes it a member of o. The first append re-slices the
+// input to its length, which forces a copy into an array the engine owns,
+// so it can never write into a caller's spare capacity; later appends grow
+// that array amortised. Attached records are not in the passes' sort
+// orders, so no pass sees them.
 func (e *engine) attach(w *WindowResult, o *Outcome, c counterpart) {
 	in := e.in
 	switch {
 	case c.ledger != nil:
-		in.Ledger = append(in.Ledger[:len(in.Ledger):len(in.Ledger)], *c.ledger)
+		if !e.ownLedger {
+			in.Ledger, e.ownLedger = in.Ledger[:len(in.Ledger):len(in.Ledger)], true
+		}
+		in.Ledger = append(in.Ledger, *c.ledger)
 		w.LedgerDate = append(w.LedgerDate, c.date)
 		o.Ledger = append(o.Ledger, int32(len(in.Ledger)-1)) //nolint:gosec // bounded like the input
 	case c.line != nil:
-		in.Lines = append(in.Lines[:len(in.Lines):len(in.Lines)], *c.line)
+		if !e.ownLines {
+			in.Lines, e.ownLines = in.Lines[:len(in.Lines):len(in.Lines)], true
+		}
+		in.Lines = append(in.Lines, *c.line)
 		w.LineDate = append(w.LineDate, c.date)
 		o.Lines = append(o.Lines, int32(len(in.Lines)-1)) //nolint:gosec // bounded like the input
 		o.Actual = Amounts{c.line.Gross, c.line.Fee, c.line.Net}

@@ -2,6 +2,8 @@ package match
 
 import (
 	"errors"
+	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -373,5 +375,42 @@ func TestAnchorDate(t *testing.T) {
 	}
 	if (&Result{In: &Input{Ledger: ledger}, Outcomes: []Outcome{{Ledger: []int32{0}}}}).AnchorDate(0) != 0 {
 		t.Fatal("a hand-built result has no rules and no anchor")
+	}
+}
+
+// The launch rehearsal found attach copying the whole record slice on every
+// attachment (258 MB allocated by one weekly window at 100k payments). Pin
+// it: 2,000 attachments over 4,000 visible lines must stay linear.
+func TestAttachIsAmortised(t *testing.T) {
+	const n = 2000
+	var ledger []domain.LedgerTxn
+	var lines []domain.SettlementLine
+	day7 := time.Date(2026, 10, 7, 3, 0, 0, 0, time.UTC)
+	for i := 0; i < n; i++ {
+		ref := fmt.Sprintf("ORD-%05d", i)
+		ledger = append(ledger, led("t"+ref, "bank_b", ref, 1_000_000, day7))
+		lines = append(lines, itemB("L"+ref, ref, 1_000_000, time.Time{}, d(11)),        // dated 11 Oct: beyond the lookahead
+			itemA("V"+ref, "OTHER-"+ref, 1_000_000, day7, d(8), -1), itemA("W"+ref, "MORE-"+ref, 1_000_000, day7, d(8), -1))
+	}
+	visible := lines[:0:0]
+	for _, l := range lines {
+		if l.Provider == "psp_a" {
+			visible = append(visible, l)
+		}
+	}
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	res, err := Reconcile(testConfig(t), &Input{AsOf: day0.AddDate(0, 0, 30), Ledger: ledger, Lines: visible,
+		Window: win(0, 6), Prober: NewMemoryProber(ledger, lines)})
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Window.Deferred != n {
+		t.Fatalf("deferred %d, want %d", res.Window.Deferred, n)
+	}
+	// Copying 4,000+ lines (~250 B each) per attachment would allocate ~2 GB.
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 64<<20 {
+		t.Fatalf("Reconcile allocated %d MiB for %d attachments: quadratic", alloc>>20, n)
 	}
 }

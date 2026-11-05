@@ -99,6 +99,9 @@ type engine struct {
 	out       []Outcome
 	ledOrder  []int32 // ledger by (provider, provider time, id)
 	lineOrder []int32 // lines by (settled_on, provider, id)
+	// ownLedger, ownLines: the engine has made in.Ledger / in.Lines its own
+	// array (window.go attach), so appending cannot touch the caller's.
+	ownLedger, ownLines bool
 }
 
 // Reconcile runs every pass and returns the outcomes. It fails only on
