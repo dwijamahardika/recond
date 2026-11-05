@@ -1,6 +1,6 @@
 # recond
 
-A **payment reconciliation engine** in Go. Where the companion `ledgerd` repo keeps the books, recond answers the question finance teams ask every morning: *does what our ledger says match what the payment provider and the bank actually settled — and if not, exactly which transactions are wrong, and why?* It ingests a ledgerd-style transfer export, settlement files in each provider's own format, and real-time payment-status webhooks that arrive duplicated and out of order. It matches 1:1 by reference, falls back to amount-and-time tolerance when references are mangled, and solves N:1 payouts that cover many transactions minus fees. Every discrepancy lands in an exception queue with evidence and an append-only audit trail. Runs are versioned and replayable, and a ground-truth property test holds the whole thing to account.
+A **payment reconciliation engine** in Go. Where the companion `ledgerd` repo keeps the books, recond answers the question finance teams ask every morning: *does what our ledger says match what the payment provider and the bank actually settled — and if not, exactly which transactions are wrong, and why?* It ingests a ledgerd-style transfer export, settlement files in each provider's own format, and real-time payment-status webhooks that arrive duplicated and out of order. It matches 1:1 by reference, falls back to amount-and-time tolerance when references are mangled, and solves N:1 payouts that cover many transactions minus fees. Every discrepancy lands in an exception queue with evidence and an append-only audit trail. Runs are versioned and replayable, can be limited to a window of business dates, and a ground-truth property test holds the whole thing to account.
 
 ```
 ledger export (ledgerd-style) ───────────────┐
@@ -76,6 +76,7 @@ The 9 `corrupt_reference` faults are not discrepancies: they must be *matched* (
 | N:1 payouts | A bank payout covers a window and states a count, but no items. If the window's expected nets sum to the payout, it settled. If it is short, recond searches for the *excluded* subset (O(n) for one, O(n log n) for two, pruned DFS with a node budget beyond). **It refuses to guess on ties**: equal-amount candidates are reported together for review. Algorithm and limits are in [Design notes](#design-notes). | `match/batch.go` |
 | Evidence | Each discrepancy stores both sides' records (settlement rows **verbatim**), the provider's payment state, expected vs actual gross/fee/net, the deadline, and a human-readable reason. | `app/run.go` |
 | Reproducible runs | A run records its input watermarks (file id, event sequence), the exact rules JSON, engine version, an input digest and a result digest. `recond verify` replays it from the event log with the stored rules and compares digests. Inputs and runs are append-only, enforced by SQLite triggers. | `app/run.go`, `adapters/sqlite/migrations/` |
+| Windowed runs | `recond run -from 2026-10-01 -to 2026-10-07` reconciles business dates in each provider's own timezone. It reads a 1-day margin either side and reports only the groups whose earliest record is in the window, so consecutive windows add up to the full run exactly: property-tested on every seed, and shown on 151,485 report rows in the launch rehearsal. A record whose partner lies beyond the margin becomes `outside_window`, never a false `missing_*`. The window is stored on the run and replayed by `verify`. A windowed run auto-closes only its own window's exceptions. Behind `RECOND_WINDOWED_RUNS` (default on, `off` is the kill switch). The whole feature is a [worked lifecycle example](#lifecycle-a-worked-example). | `match/window.go`, `adapters/sqlite/window.go`, [ADR 0001](docs/adr/0001-windowed-runs-boundary-semantics.md) |
 | Exception queue | One exception per distinct discrepancy (class plus exact records) across runs. Humans resolve or reopen with a mandatory reason; recond auto-closes what disappears and reopens what comes back, but never overrides a human resolution. The audit trail is append-only (triggers reject `UPDATE`/`DELETE`). Over HTTP the resolver is the authenticated principal, never a request field. | `adapters/sqlite/exceptions.go`, `app/exceptions.go` |
 | Ground truth | `cmd/gen` builds a world with 14 kinds of injected settlement and ledger faults (dropped on either side, duplicated, amount or fee changed, settled past T+N, reference corrupted, and the batch-level equivalents: an item left out of a payout, a payout item missing from the ledger, a payout credited twice). It adds webhook chaos (duplicated, shuffled, stale re-sends) and payments placed milliseconds before cut-offs, and records the right answer. The property test (24 seeds × 3,000 payments, about 5,000 faults per run) demands **every fault classified exactly, nothing clean flagged, every match paired with the line that settled it**. | `gen/`, `gen/groundtruth_test.go` |
 | Testing | Table tests for parsers, fees, the state machine and every matcher path; order-independence property test (3,000 random histories × 8 delivery orders); Go native fuzzing of every parser; end-to-end tests through SQLite and the CSV report; HTTP tests for signature, replay and auth; race detector on. Mutation-checked (see design notes). | `*_test.go` |
@@ -95,6 +96,7 @@ export RECOND_DB=recond.db
 bin/gen -out data -n 10000 -seed 1                  # synthetic world + data/truth.json
 bin/recond ingest -dir data                         # or: -kind ledger|settlement|webhooks [-provider p] FILE...
 bin/recond run -as-of 2026-10-14                    # gen prints the as-of to use; versioned run + summary
+bin/recond run -as-of 2026-10-14 -from 2026-10-01 -to 2026-10-07   # one week of business dates (margins: -lookbehind/-lookahead, default 1 day)
 bin/recond report -out reports                      # reports/run-1/items.csv + summary.json
 bin/gen score -truth data/truth.json -items reports/run-1/items.csv
 bin/recond verify 1                                 # replay from the event log, compare digests
@@ -103,6 +105,7 @@ bin/recond exceptions show 17                       # evidence + audit trail
 bin/recond resolve 17 -by ops.reviewer -reason "provider confirmed correction in next cycle"
 bin/recond payment psp_a ORD-20261001-0000042       # webhook-derived state and event history
 bin/recond config                                   # provider rules in effect (RECOND_PROVIDERS_FILE to override)
+bin/recond migrations                               # applied schema migrations, window_date backfill status
 ```
 
 ### HTTP
@@ -125,7 +128,7 @@ curl -s localhost:8080/v1/webhooks/psp_a -H "Webhook-Timestamp: $ts" -H "Webhook
 ```
 POST /v1/webhooks/{provider}            HMAC-signed provider events
 GET  /v1/payments/{provider}/{ref}      state + events                      (X-API-Key)
-POST /v1/runs                           run now, optional {"as_of": ...}    (X-API-Key)
+POST /v1/runs                           run now, optional {"as_of": ..., "window": {"from": "2026-10-01", "to": "2026-10-07"}}  (X-API-Key)
 GET  /v1/runs  /v1/runs/{id|latest}     summaries
 GET  /v1/runs/{id}/items.csv            the report
 POST /v1/runs/{id}/verify               replay and compare digests
@@ -148,7 +151,24 @@ make fuzz        # short fuzzing pass over every parser (FUZZTIME=20s)
 make bench       # micro-benchmarks: parsers, fold, matcher
 make bench-e2e SIZES="100000 1000000"
 make demo
+make rehearse    # windowed-runs launch rehearsal: upgrade from main, windows vs full run, cost (N, DAYS, SIZES, REPEAT)
 ```
+
+## Lifecycle: a worked example
+
+[`docs/lifecycle/windowed-runs/`](docs/lifecycle/windowed-runs/) takes one feature, windowed runs, from problem to post-launch. Every artifact is real and in this history as a series of small commits:
+
+| Step | Document | What it holds |
+|---|---|---|
+| 1 | [PRD](docs/lifecycle/windowed-runs/01-prd.md) | problem, users (personas), success metrics set *before* building, non-goals |
+| 2 | [RFC](docs/lifecycle/windowed-runs/02-rfc.md) + [ADR 0001](docs/adr/0001-windowed-runs-boundary-semantics.md) | boundary semantics with alternatives, exact guarantees and their conditions, data model, API, edge cases, risks |
+| 3 | [Test plan](docs/lifecycle/windowed-runs/03-test-plan.md) | each risk mapped to a named test, including the property tests |
+| 4 | [Migration plan](docs/lifecycle/windowed-runs/04-migration-plan.md) | expand, migrate, contract under append-only tables; compatibility matrix for old and new binaries |
+| 5 | [Rollout plan](docs/lifecycle/windowed-runs/05-rollout-plan.md) + [runbook](docs/lifecycle/windowed-runs/06-runbook.md) | stages, go/no-go, rollback triggers; alerts, metrics, failure modes with CLI diagnosis |
+| 6 | [Launch review](docs/lifecycle/windowed-runs/07-launch-review.md) | a **local rehearsal** (not a production launch): real numbers, drills, and what went wrong |
+| 7 | [Cleanup](docs/lifecycle/windowed-runs/08-cleanup.md) | why the flag stays for now, the criteria for removing it, and the removal checklist |
+
+Two findings are worth reading even if nothing else is. The property test for undersized margins rejected the first deferral design (RFC §5 amendment). And the first rehearsal missed its memory target until a profile showed a quadratic copy that every test had passed (launch review).
 
 ## Design notes
 
@@ -175,7 +195,9 @@ Limits: it assumes one payout per provider window (a window split across payouts
 
 **SQLite, and a negative result.** Pure-Go SQLite keeps recond a single static binary with real transactions, and lets tests run the real store in a temp directory. Ingestion uses single-row prepared `INSERT … ON CONFLICT DO NOTHING` inside one transaction per file. To cut per-statement overhead I tried multi-row `INSERT … RETURNING`. It was slower at every batch size tried: the 100k webhook backfill went from about 13s to 20–26s at 8–128 rows per statement. The profile showed three causes: the driver binds parameters with a linear scan per parameter (quadratic per statement), `RETURNING` buffers result rows, and multi-row conflict handling needs a statement journal. I reverted it. For plain appends of run results, multi-row does win (save phase 2.1s vs 3.0s single-row at 100k), so it is used there. In-file duplicate webhook deliveries are classified from memory, and new-payment replays fold in memory, which got the 100k backfill from 13.7s to 11–12.5s. Webhook application is chunked (100k events) so a multi-million-event backfill does not hold every event until commit.
 
-**What I'd add next.** Windowed runs with a lookback, instead of reconciling all history every time. The third leg: paid at the provider but absent from the ledger *before* settlement exists. Refunds after settlement (negative lines), and adjustment rows. A Postgres adapter for multi-replica deployments. Per-merchant payouts. Streaming input loading for 10M+ transaction runs.
+**Windows decide what a run reads and who reports a group, never how records pair.** Matching keeps the provider's clock for T+N and payout cycles. A window only dates each record (ledger booking time; the provider's transaction time for a settlement line, or `settled_on − N` without one; a payout's period start), reads a margin around it, and reports the groups whose earliest record falls inside. When a partner lies beyond the margin, the run defers instead of guessing. Partners are looked up right after the reference pass, so the tolerance and batch passes see exactly the pools a full run's do. The [ADR](docs/adr/0001-windowed-runs-boundary-semantics.md) states when consecutive windows equal a full run and what degrades otherwise.
+
+**What I'd add next.** A runtime signal for the windowing limit on amount/time and payout pairs further apart than the margin. The third leg: paid at the provider but absent from the ledger *before* settlement exists. Refunds after settlement (negative lines), and adjustment rows. A Postgres adapter for multi-replica deployments. Per-merchant payouts. Streaming input loading for 10M+ transaction runs.
 
 ## Benchmarks
 
@@ -205,6 +227,18 @@ Micro-benchmarks (`make bench`, same machine):
 | webhook body decode + validate | 3.2 µs/op |
 | `match.Reconcile`, in memory, 10k / 100k attempts | 399k / 331k ledger txns/s |
 
+### Windowed runs
+
+From the [launch rehearsal](docs/lifecycle/windowed-runs/07-launch-review.md) (`make rehearse`): 100k payment attempts over 28 days, one window against the full run on the same database, median of 3. **Environment:** a 4 vCPU cloud VM (Intel Xeon Processor @ 2.10GHz, a different host from the table above) with 16 GiB RAM, shared with other jobs.
+
+| | wall · peak RSS | share of full | ledger rows read |
+|---|---:|---:|---:|
+| full run | 2.92s · 357 MiB | | 94,756 |
+| 7-day window | 1.05s · 145 MiB | 36% · 41% | 30,489 |
+| 1-day window | 0.32s · 60 MiB | 11% · 17% | 10,169 |
+
+The union of consecutive weekly or daily windows equalled the full run's 151,485 report rows exactly. The six indexes migration `0002` adds cost +3.5% and +5.8% ingest wall time in two single runs. Building them on the existing 100k database took 0.4s.
+
 ## Layout
 
 ```
@@ -220,19 +254,21 @@ internal/adapters/
   httpapi/               handlers, HMAC webhook verification, middleware, metrics
 internal/config/         env config + example provider rules (embedded)
 internal/platform/clock/ testable time
-scripts/                 demo.sh, bench.sh
+scripts/                 demo.sh, bench.sh, rehearse-windows.sh
+docs/                    lifecycle/windowed-runs/ (PRD to cleanup), adr/
 ```
 
 ## Status
 
-Working end to end: ingestion with idempotency and conflict detection, the state machine, all matching passes including N:1, all outcome classes with evidence, versioned and replayable runs, the exception queue with an audit trail, the CLI, the HTTP API with signed webhooks, reports, the generator, and the scorer. Checked: `go test -race ./...`, `go vet ./...`, `gofmt -l .`, golangci-lint v2 against `.golangci.yml` (0 issues), `make demo`, 60s fuzzing runs of each of the six parser fuzz targets (1.2M–3.2M executions each, no failures), and the benchmarks above.
+Working end to end: ingestion with idempotency and conflict detection, the state machine, all matching passes including N:1, all outcome classes with evidence, versioned and replayable runs, date-windowed runs, the exception queue with an audit trail, the CLI, the HTTP API with signed webhooks, reports, the generator, and the scorer. Checked: `go test -race ./...`, `go vet ./...`, `gofmt -l .`, golangci-lint v2 against `.golangci.yml` (0 issues), `make demo`, 60s fuzzing runs of each of the six parser fuzz targets (1.2M–3.2M executions each, no failures), the benchmarks above, and the windowed-runs launch rehearsal. The fuzzing and the 1M benchmarks predate windowed runs. Windowing touches no parser.
 
 Not done, or deliberately out of scope:
 - **The Dockerfile and CI workflow have not run yet.** The image build needs a Docker daemon, and CI runs on the first push.
-- **Runs reconcile everything ingested**, with no date windowing or archival. That suits daily batches of the size measured above, not years of history in one database.
+- **Windowed runs have been rehearsed, not run in production.** The [launch review](docs/lifecycle/windowed-runs/07-launch-review.md) says exactly what was and was not exercised. Known limits ([RFC §6](docs/lifecycle/windowed-runs/02-rfc.md#6-guarantees-and-exactly-when-they-hold)): a pair matched on amount and time, or by payout cycle, whose records are dated further apart than the margin can surface as a false discrepancy, which no runtime signal catches yet. Settlement lines without a transaction time need a margin as large as their lateness. References reused across distant records are deferred, not resolved. The feature flag is still in place, by decision ([cleanup](docs/lifecycle/windowed-runs/08-cleanup.md)).
+- **No archival.** Windows bound what a run reads. The database still holds all history, and full runs still read all of it.
 - **The pre-settlement leg isn't classified.** A webhook saying "paid" with no ledger transaction appears as evidence, not as its own class.
 - **Not modelled:** refunds after settlement, chargebacks and adjustment rows (negative or zero rows are rejected with a reason); per-merchant payouts (one payout per provider window is assumed); tiered or capped fee schedules; FX (a currency mismatch is an `amount_mismatch`). In the fictional fee model, fees on partially refunded payments are computed on the gross net of refunds.
 - **Tolerance matching is greedy** (closest provider time first, deterministic tie-break), not a global assignment.
 - **Single SQLite file:** writes are serialised in-process and reads use WAL snapshots. Several replicas would need a Postgres adapter behind the same app layer.
 - **Settlement files are ingested through the CLI only;** there is no upload endpoint. Webhook secrets are one per provider: senders can rotate (several signatures are accepted), but a receiver-side dual-secret window is not implemented.
-- **Memory:** a run holds every input record, payment state and outcome in memory, peaking at 2.48 GiB at 1M. A webhook backfill holds the file's event keys and the touched payment states until commit, peaking at 1.95 GiB for 3.46M deliveries. Streaming or windowed runs are the fix.
+- **Memory:** a full run holds every input record, payment state and outcome in memory, peaking at 2.48 GiB at 1M. A webhook backfill holds the file's event keys and the touched payment states until commit, peaking at 1.95 GiB for 3.46M deliveries. A windowed run holds only its window and margins (145 MiB for one week of 28 days at 100k, above), so its memory follows the window, not the history. A full run and the webhook backfill are unchanged. Streaming is the fix there.
