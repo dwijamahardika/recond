@@ -59,7 +59,9 @@ type Summary struct {
 }
 
 // WindowSummary says what a windowed run covered and what it saw around it.
-// Ledger and line counts elsewhere in the summary are in-window counts.
+// Ledger and line counts elsewhere in the summary count the records the run
+// reports (members of the groups it owns); the counts here are by each
+// record's own window date.
 type WindowSummary struct {
 	match.Window
 	Days int `json:"days"`
@@ -114,13 +116,27 @@ func windowSummary(rules *match.Config, wr *match.WindowResult) *WindowSummary {
 }
 
 func summarize(res *match.Result) Summary {
+	// A full run reports every record it read. A windowed run reports the
+	// records of the groups it owns: those partition across consecutive
+	// windows exactly as groups do, and keep match rates within 100%
+	// (dating by record would not: a payout member booked after midnight
+	// is dated in the margin but belongs to a group this window owns).
 	classes := domain.Classes
 	inLedger := func(int) bool { return true }
 	inLines := func(int) bool { return true }
-	if wr := res.Window; wr != nil {
+	if res.Window != nil {
 		classes = domain.WindowClasses
-		inLedger = func(i int) bool { return wr.Window.Contains(wr.LedgerDate[i]) }
-		inLines = func(i int) bool { return wr.Window.Contains(wr.LineDate[i]) }
+		led, lin := map[int]bool{}, map[int]bool{}
+		for i := range res.Outcomes {
+			for _, j := range res.Outcomes[i].Ledger {
+				led[int(j)] = true
+			}
+			for _, j := range res.Outcomes[i].Lines {
+				lin[int(j)] = true
+			}
+		}
+		inLedger = func(i int) bool { return led[i] }
+		inLines = func(i int) bool { return lin[i] }
 	}
 	byClass := map[domain.Class]*ClassStat{}
 	for _, c := range classes {
@@ -281,11 +297,11 @@ func (s *Service) Run(ctx context.Context, opt RunOptions) (*Summary, error) {
 	attrs := []any{"run_id", runID, "ledger", sum.LedgerTxns, "lines", sum.Lines, "discrepancies", sum.Discrepancies,
 		"opened", sync.Opened, "auto_closed", sync.AutoClosed, "duration_ms", timings["total"], "digest", digest}
 	if w := sum.Window; w != nil {
-		attrs = append(attrs, "window", w.Window.String(), "ledger_in_margin", w.LedgerInMargin, "lines_in_margin", w.LinesInMargin,
+		attrs = append(attrs, "window", w.String(), "ledger_in_margin", w.LedgerInMargin, "lines_in_margin", w.LinesInMargin,
 			"groups_not_owned", w.GroupsNotOwned, "outside_window", w.OutsideWindow)
 		if w.OutsideWindow > 0 {
 			s.log.Warn("windowed run deferred groups whose counterpart is outside its margins", "run_id", runID,
-				"window", w.Window.String(), "outside_window", w.OutsideWindow)
+				"window", w.String(), "outside_window", w.OutsideWindow)
 		}
 	}
 	s.log.Info("run complete", attrs...)

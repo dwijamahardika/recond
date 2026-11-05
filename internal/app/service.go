@@ -81,6 +81,11 @@ func NewService(store *sqlite.Store, rules *match.Config, clk clock.Clock, log *
 // WindowedRunsEnabled reports the feature flag.
 func (s *Service) WindowedRunsEnabled() bool { return s.windowed }
 
+// SchemaStatus reports applied migrations and the window_date backfill.
+func (s *Service) SchemaStatus(ctx context.Context) (sqlite.SchemaStatus, error) {
+	return s.store.SchemaStatus(ctx)
+}
+
 // Rules returns the provider rules in effect.
 func (s *Service) Rules() *match.Config { return s.rules }
 

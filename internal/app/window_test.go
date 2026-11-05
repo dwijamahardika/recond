@@ -106,6 +106,11 @@ func TestWindowedRunsThroughStorage(t *testing.T) {
 		}
 		ledger += sum.LedgerTxns
 		stillOpen += sum.Exceptions.StillOpen
+		for _, p := range sum.Providers {
+			if p.MatchRate > 1 || p.Matched+p.Flagged > p.LedgerTxns {
+				t.Fatalf("window %s: provider stats beyond 100%%: %+v", win, p)
+			}
+		}
 		got = append(got, itemRows(t, svc, sum.RunID)...)
 		var buf bytes.Buffer
 		if _, err := svc.WriteItemsCSV(ctx, sum.RunID, &buf); err != nil {
