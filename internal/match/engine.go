@@ -63,12 +63,22 @@ type Input struct {
 	Ledger   []domain.LedgerTxn
 	Lines    []domain.SettlementLine
 	Payments map[domain.PaymentKey]domain.Payment
+	// Window, when set, restricts the run to records dated in its visible
+	// range and keeps only the groups it owns (window.go). Prober is then
+	// required: it finds counterparts outside the visible range.
+	Window *Window
+	Prober Prober
 }
 
-// Result is a run's outcomes plus the input they index into.
+// Result is a run's outcomes plus the input they index into. For a
+// windowed run, In holds the visible records (plus attached counterparts)
+// and Window says how the window shaped the result.
 type Result struct {
 	In       *Input
 	Outcomes []Outcome
+	Window   *WindowResult
+
+	cfg *Config
 }
 
 type txnState struct {
@@ -99,6 +109,20 @@ func Reconcile(cfg *Config, in *Input) (*Result, error) {
 			return nil, err
 		}
 	}
+	var win *WindowResult
+	if in.Window != nil {
+		if err := in.Window.Validate(); err != nil {
+			return nil, err
+		}
+		if in.Prober == nil {
+			return nil, fmt.Errorf("%w: a windowed run needs a counterpart prober", errConfig)
+		}
+		vis, wr, err := restrict(cfg, in)
+		if err != nil {
+			return nil, err
+		}
+		in, win = vis, wr
+	}
 	if len(in.Ledger) > math.MaxInt32 || len(in.Lines) > math.MaxInt32 {
 		return nil, fmt.Errorf("%w: more than %d records; outcomes index records with int32", errConfig, math.MaxInt32)
 	}
@@ -111,7 +135,13 @@ func Reconcile(cfg *Config, in *Input) (*Result, error) {
 	e.byTolerance()
 	e.batches()
 	e.leftovers()
-	return &Result{In: in, Outcomes: e.out}, nil
+	res := &Result{In: in, Outcomes: e.out, Window: win, cfg: cfg}
+	if win != nil {
+		if err := e.own(win, res); err != nil {
+			return nil, err
+		}
+	}
+	return res, nil
 }
 
 func (e *engine) prepare() error {
