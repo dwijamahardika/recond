@@ -91,15 +91,24 @@ func fingerprint(o *match.Outcome, res *match.Result) (string, string) {
 	return hex.EncodeToString(h.Sum(nil)[:16]), summary
 }
 
+// syncExceptions opens, reopens and auto-closes exceptions for a run, and
+// dates every exception it touches (window_date: its earliest record's
+// window date). A full run auto-closes every open exception it did not
+// see. A windowed run only sees its window, so it auto-closes only open
+// exceptions dated inside the window - never an undated one (written before
+// window_date existed) and never one whose records it deferred as
+// outside_window, which have no verdict yet.
 func syncExceptions(ctx context.Context, tx *sql.Tx, runID, now int64, res *match.Result) (ExceptionSync, error) {
 	var sync ExceptionSync
 	type known struct {
-		id     int64
-		status string
+		id       int64
+		status   string
+		date     domain.Date // 0: undated
+		run, out int64       // latest occurrence
 	}
 	existing := map[string]known{}
 	err := func() error {
-		rows, err := tx.QueryContext(ctx, `SELECT id, fingerprint, status FROM exceptions`)
+		rows, err := tx.QueryContext(ctx, `SELECT id, fingerprint, status, window_date, run_id, outcome_id FROM exceptions`)
 		if err != nil {
 			return err
 		}
@@ -107,8 +116,14 @@ func syncExceptions(ctx context.Context, tx *sql.Tx, runID, now int64, res *matc
 		for rows.Next() {
 			var k known
 			var fp string
-			if err := rows.Scan(&k.id, &fp, &k.status); err != nil {
+			var date sql.NullString
+			if err := rows.Scan(&k.id, &fp, &k.status, &date, &k.run, &k.out); err != nil {
 				return err
+			}
+			if date.Valid {
+				if err := k.date.UnmarshalText([]byte(date.String)); err != nil {
+					return fmt.Errorf("exception %d window_date: %w", k.id, err)
+				}
 			}
 			existing[fp] = k
 		}
@@ -130,11 +145,15 @@ func syncExceptions(ctx context.Context, tx *sql.Tx, runID, now int64, res *matc
 		}
 		seen[fp] = true
 		delta := o.Actual.Net - o.Expected.Net
+		var date any // NULL when the result cannot date it (hand-built in tests)
+		if d := res.AnchorDate(i); !d.IsZero() {
+			date = d.String()
+		}
 		k, ok := existing[fp]
 		if !ok {
 			x, err := tx.ExecContext(ctx, `INSERT INTO exceptions (fingerprint, class, provider, currency, status, first_run, last_run, run_id, outcome_id,
-				refs, delta, detail, opened_at, updated_at) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				fp, string(o.Class), o.Provider, string(o.Currency), runID, runID, runID, i+1, refs, delta, o.Detail, now, now)
+				refs, delta, detail, opened_at, updated_at, window_date) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				fp, string(o.Class), o.Provider, string(o.Currency), runID, runID, runID, i+1, refs, delta, o.Detail, now, now, date)
 			if err != nil {
 				return sync, err
 			}
@@ -161,20 +180,38 @@ func syncExceptions(ctx context.Context, tx *sql.Tx, runID, now int64, res *matc
 		default:
 			sync.StillOpen++
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE exceptions SET status = ?, last_run = ?, run_id = ?, outcome_id = ?, refs = ?, delta = ?, detail = ?, updated_at = ?
-			WHERE id = ?`, status, runID, runID, i+1, refs, delta, o.Detail, now, k.id); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE exceptions SET status = ?, last_run = ?, run_id = ?, outcome_id = ?, refs = ?, delta = ?, detail = ?, updated_at = ?,
+			window_date = coalesce(?, window_date) WHERE id = ?`, status, runID, runID, i+1, refs, delta, o.Detail, now, date, k.id); err != nil {
 			return sync, err
 		}
 	}
 	stale := make([]string, 0)
 	for fp, k := range existing {
-		if !seen[fp] && k.status == StatusOpen {
-			stale = append(stale, fp)
+		if seen[fp] || k.status != StatusOpen {
+			continue
 		}
+		if w := res.Window; w != nil && (k.date.IsZero() || !w.Window.Contains(k.date)) {
+			continue // outside this window's scope, or undated
+		}
+		stale = append(stale, fp)
 	}
 	sort.Slice(stale, func(i, j int) bool { return existing[stale[i]].id < existing[stale[j]].id })
+	var deferred map[string]bool
+	if res.Window != nil {
+		deferred = deferredRecords(res)
+	}
 	for _, fp := range stale {
 		k := existing[fp]
+		if len(deferred) > 0 {
+			hit, err := membersIn(ctx, tx, k.run, k.out, deferred)
+			if err != nil {
+				return sync, err
+			}
+			if hit {
+				sync.KeptDeferred++
+				continue
+			}
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE exceptions SET status = 'auto_closed', updated_at = ? WHERE id = ?`, now, k.id); err != nil {
 			return sync, err
 		}
@@ -184,6 +221,48 @@ func syncExceptions(ctx context.Context, tx *sql.Tx, runID, now int64, res *matc
 		sync.AutoClosed++
 	}
 	return sync, nil
+}
+
+// deferredRecords returns the records ("L:" ledger id, "S:" line id) of a
+// result's outside_window groups.
+func deferredRecords(res *match.Result) map[string]bool {
+	out := map[string]bool{}
+	for i := range res.Outcomes {
+		o := &res.Outcomes[i]
+		if o.Class != domain.ClassOutsideWindow {
+			continue
+		}
+		for _, j := range o.Ledger {
+			out["L:"+res.In.Ledger[j].ID] = true
+		}
+		for _, j := range o.Lines {
+			out["S:"+res.In.Lines[j].ID] = true
+		}
+	}
+	return out
+}
+
+// membersIn reports whether any member of a stored outcome is in set.
+func membersIn(ctx context.Context, tx *sql.Tx, runID, outcomeID int64, set map[string]bool) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT role, entity_id FROM run_members WHERE run_id = ? AND outcome_id = ? AND role <> 'context'`, runID, outcomeID)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var role, id string
+		if err := rows.Scan(&role, &id); err != nil {
+			return false, err
+		}
+		prefix := "S:"
+		if role == "ledger" {
+			prefix = "L:"
+		}
+		if set[prefix+id] {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func appendEvent(ctx context.Context, tx *sql.Tx, id int64, action, actor, reason string, runID *int64, at int64) error {

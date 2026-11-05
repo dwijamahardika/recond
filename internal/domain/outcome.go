@@ -15,23 +15,31 @@ const (
 	// ClassAwaitingSettlement is informational, not a discrepancy: the ledger
 	// transaction is unmatched but its T+N deadline has not passed yet.
 	ClassAwaitingSettlement Class = "awaiting_settlement"
+	// ClassOutsideWindow is informational, not a discrepancy, and only
+	// produced by windowed runs: the record's counterpart exists but is dated
+	// outside what the run could see, so the run defers the verdict instead
+	// of calling it missing. A wider margin makes it disappear.
+	ClassOutsideWindow Class = "outside_window"
 )
 
-// Classes lists every class in report order.
+// Classes lists every class a full-history run can produce, in report order.
 var Classes = []Class{
 	ClassMatched, ClassAmountMismatch, ClassFeeMismatch, ClassLateSettlement,
 	ClassDuplicateSettlement, ClassMissingInSettlement, ClassMissingInLedger,
 	ClassAwaitingSettlement,
 }
 
+// WindowClasses lists every class a windowed run can produce, in report order.
+var WindowClasses = append(Classes[:len(Classes):len(Classes)], ClassOutsideWindow)
+
 // IsDiscrepancy reports whether the class goes to the exception queue.
 func (c Class) IsDiscrepancy() bool {
-	return c != ClassMatched && c != ClassAwaitingSettlement && c != ""
+	return c != ClassMatched && c != ClassAwaitingSettlement && c != ClassOutsideWindow && c != ""
 }
 
 // Valid reports whether c is a known class.
 func (c Class) Valid() bool {
-	for _, k := range Classes {
+	for _, k := range WindowClasses {
 		if k == c {
 			return true
 		}

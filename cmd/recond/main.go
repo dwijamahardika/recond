@@ -36,8 +36,9 @@ Usage:
 
 Commands:
   ingest      ingest ledger exports, settlement files and webhook event files
-  run         reconcile everything ingested so far and store a versioned run
-  verify      replay a stored run from its recorded inputs and rules
+  run         reconcile everything ingested so far (or, with -from/-to, a window
+              of business dates) and store a versioned run
+  verify      replay a stored run from its recorded inputs, rules and window
   runs        list runs
   report      write a run's items.csv and summary.json
   exceptions  list the exception queue, or "exceptions show ID"
@@ -46,6 +47,7 @@ Commands:
   payment     show a payment's webhook-derived state and events
   serve       run the HTTP API (webhooks, runs, exceptions, metrics)
   config      print the provider rules in effect
+  migrations  show applied schema migrations and the windowed-runs backfill
   version     print the version
 
 Every command accepts -db (default $RECOND_DB or ./recond.db).
@@ -99,6 +101,8 @@ func dispatch(ctx context.Context, cmd string, args []string, out io.Writer) err
 		return cmdServe(ctx, args)
 	case "config":
 		return cmdConfig(args, out)
+	case "migrations":
+		return cmdMigrations(ctx, args, out)
 	case "version", "-v", "--version":
 		_, err := fmt.Fprintln(out, "recond", version)
 		return err
@@ -140,6 +144,10 @@ func open(ctx context.Context, c common) (*app.Service, *sqlite.Store, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	windowed, err := config.WindowedRuns()
+	if err != nil {
+		return nil, nil, err
+	}
 	store, err := sqlite.Open(ctx, c.db)
 	if err != nil {
 		return nil, nil, err
@@ -149,7 +157,7 @@ func open(ctx context.Context, c common) (*app.Service, *sqlite.Store, error) {
 		level = slog.LevelInfo
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
-	return app.NewService(store, rules, nil, log, nil), store, nil
+	return app.NewService(store, rules, nil, log, nil, app.WithWindowedRuns(windowed)), store, nil
 }
 
 // startProfile writes a CPU profile of one CLI command when

@@ -53,11 +53,93 @@ type Summary struct {
 	Providers     []ProviderStat       `json:"providers"`
 	Exceptions    sqlite.ExceptionSync `json:"exceptions"`
 	Timings       map[string]int64     `json:"timings_ms"`
+	// Window is present only for windowed runs; a full run's summary is
+	// exactly what it was before windowed runs existed.
+	Window *WindowSummary `json:"window,omitempty"`
+}
+
+// WindowSummary says what a windowed run covered and what it saw around it.
+// Ledger and line counts elsewhere in the summary count the records the run
+// reports (members of the groups it owns); the counts here are by each
+// record's own window date.
+type WindowSummary struct {
+	match.Window
+	Days int `json:"days"`
+	// Providers gives each provider's window as instants: business dates
+	// are civil dates in each provider's own timezone.
+	Providers      []WindowBounds `json:"providers"`
+	LedgerInWindow int            `json:"ledger_txns_in_window"`
+	LedgerInMargin int            `json:"ledger_txns_in_margin"`
+	LinesInWindow  int            `json:"settlement_lines_in_window"`
+	LinesInMargin  int            `json:"settlement_lines_in_margin"`
+	// Attached counts counterparts from outside the visible range attached
+	// to outside_window groups.
+	Attached int `json:"counterparts_attached"`
+	// GroupsNotOwned were computed over the visible range only to give
+	// boundary records their counterparts; a neighbouring window owns them.
+	GroupsNotOwned int `json:"groups_not_owned"`
+	// OutsideWindow counts deferred groups: should be 0 with adequate margins.
+	OutsideWindow int `json:"outside_window"`
+}
+
+// WindowBounds is one provider's window [From, To) as instants.
+type WindowBounds struct {
+	Provider string    `json:"provider"`
+	Timezone string    `json:"timezone"`
+	From     time.Time `json:"from"`
+	To       time.Time `json:"to"`
+}
+
+func windowSummary(rules *match.Config, wr *match.WindowResult) *WindowSummary {
+	w := wr.Window
+	ws := &WindowSummary{Window: w, Days: w.Days(), GroupsNotOwned: wr.NotOwned, OutsideWindow: wr.Deferred}
+	for _, name := range rules.Names() {
+		p, _ := rules.Provider(name)
+		ws.Providers = append(ws.Providers, WindowBounds{Provider: name, Timezone: p.Timezone,
+			From: w.From.StartIn(p.Location()).UTC(), To: w.To.AddDays(1).StartIn(p.Location()).UTC()})
+	}
+	count := func(dates []domain.Date, in, margin *int) {
+		for _, d := range dates {
+			switch wr.Scope(d) {
+			case "window":
+				*in++
+			case "margin":
+				*margin++
+			default:
+				ws.Attached++
+			}
+		}
+	}
+	count(wr.LedgerDate, &ws.LedgerInWindow, &ws.LedgerInMargin)
+	count(wr.LineDate, &ws.LinesInWindow, &ws.LinesInMargin)
+	return ws
 }
 
 func summarize(res *match.Result) Summary {
+	// A full run reports every record it read. A windowed run reports the
+	// records of the groups it owns: those partition across consecutive
+	// windows exactly as groups do, and keep match rates within 100%
+	// (dating by record would not: a payout member booked after midnight
+	// is dated in the margin but belongs to a group this window owns).
+	classes := domain.Classes
+	inLedger := func(int) bool { return true }
+	inLines := func(int) bool { return true }
+	if res.Window != nil {
+		classes = domain.WindowClasses
+		led, lin := map[int]bool{}, map[int]bool{}
+		for i := range res.Outcomes {
+			for _, j := range res.Outcomes[i].Ledger {
+				led[int(j)] = true
+			}
+			for _, j := range res.Outcomes[i].Lines {
+				lin[int(j)] = true
+			}
+		}
+		inLedger = func(i int) bool { return led[i] }
+		inLines = func(i int) bool { return lin[i] }
+	}
 	byClass := map[domain.Class]*ClassStat{}
-	for _, c := range domain.Classes {
+	for _, c := range classes {
 		byClass[c] = &ClassStat{Class: c}
 	}
 	prov := map[string]*ProviderStat{}
@@ -67,13 +149,19 @@ func summarize(res *match.Result) Summary {
 		}
 		return prov[name]
 	}
-	for _, t := range res.In.Ledger {
-		p(t.Provider).LedgerTxns++
+	sum := Summary{Payments: len(res.In.Payments), Outcomes: len(res.Outcomes)}
+	for i, t := range res.In.Ledger {
+		if inLedger(i) {
+			p(t.Provider).LedgerTxns++
+			sum.LedgerTxns++
+		}
 	}
-	for _, l := range res.In.Lines {
-		p(l.Provider).Lines++
+	for i, l := range res.In.Lines {
+		if inLines(i) {
+			p(l.Provider).Lines++
+			sum.Lines++
+		}
 	}
-	sum := Summary{LedgerTxns: len(res.In.Ledger), Lines: len(res.In.Lines), Payments: len(res.In.Payments), Outcomes: len(res.Outcomes)}
 	for i := range res.Outcomes {
 		o := &res.Outcomes[i]
 		cs := byClass[o.Class]
@@ -98,7 +186,7 @@ func summarize(res *match.Result) Summary {
 			p(o.Provider).Flagged += len(o.Ledger)
 		}
 	}
-	for _, c := range domain.Classes {
+	for _, c := range classes {
 		sum.Classes = append(sum.Classes, *byClass[c])
 	}
 	names := make([]string, 0, len(prov))
@@ -119,13 +207,27 @@ func summarize(res *match.Result) Summary {
 // RunOptions configures a run.
 type RunOptions struct {
 	AsOf time.Time // zero: now
+	// Window restricts the run to business dates (zero margins mean the
+	// default); nil reconciles the whole history. Needs the feature flag.
+	Window *match.Window
 }
 
-// Run reconciles everything ingested so far and stores the result.
+// Run reconciles everything ingested so far - or, with a window, the
+// window's business dates - and stores the result.
 func (s *Service) Run(ctx context.Context, opt RunOptions) (*Summary, error) {
 	t0 := s.clock.Now()
 	if opt.AsOf.IsZero() {
 		opt.AsOf = t0
+	}
+	if opt.Window != nil {
+		if !s.windowed {
+			return nil, ErrWindowedRunsDisabled
+		}
+		w := opt.Window.WithDefaults()
+		if err := w.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrValidation, err)
+		}
+		opt.Window = &w
 	}
 	timings := map[string]int64{}
 	mark := func(name string, since time.Time) time.Time {
@@ -134,12 +236,22 @@ func (s *Service) Run(ctx context.Context, opt RunOptions) (*Summary, error) {
 		return now
 	}
 	start := time.Now()
-	in, err := s.store.LoadInputs(ctx)
+	var in *sqlite.Inputs
+	var err error
+	if opt.Window != nil {
+		in, err = s.store.LoadWindow(ctx, opt.Window.Bounds(s.rules))
+	} else {
+		in, err = s.store.LoadInputs(ctx)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("load inputs: %w", err)
 	}
 	step := mark("load", start)
-	res, err := match.Reconcile(s.rules, &match.Input{AsOf: opt.AsOf.UTC(), Ledger: in.Ledger, Lines: in.Lines, Payments: in.Payments})
+	mi := &match.Input{AsOf: opt.AsOf.UTC(), Ledger: in.Ledger, Lines: in.Lines, Payments: in.Payments}
+	if opt.Window != nil {
+		mi.Window, mi.Prober = opt.Window, s.store.Prober(ctx, in.MaxFileID)
+	}
+	res, err := match.Reconcile(s.rules, mi)
 	if err != nil {
 		return nil, err
 	}
@@ -159,12 +271,15 @@ func (s *Service) Run(ctx context.Context, opt RunOptions) (*Summary, error) {
 	sum := summarize(res)
 	sum.AsOf, sum.EngineVersion, sum.ConfigSHA256 = opt.AsOf.UTC(), match.EngineVersion, hex.EncodeToString(cfgSum[:])
 	sum.InputDigest, sum.ResultDigest, sum.MaxFileID, sum.MaxEventSeq = in.Digest, digest, in.MaxFileID, in.MaxEventSeq
+	if res.Window != nil {
+		sum.Window = windowSummary(s.rules, res.Window)
+	}
 	summaryJSON, _ := json.Marshal(sum)
 	run := sqlite.Run{
 		AsOf: opt.AsOf.UTC(), EngineVersion: match.EngineVersion, ConfigJSON: string(cfgJSON), ConfigSHA256: sum.ConfigSHA256,
 		MaxFileID: in.MaxFileID, MaxEventSeq: in.MaxEventSeq, InputDigest: in.Digest, ResultDigest: digest,
-		LedgerCount: len(in.Ledger), LineCount: len(in.Lines), PaymentCount: len(in.Payments),
-		SummaryJSON: string(summaryJSON), DurationMS: time.Since(start).Milliseconds(),
+		LedgerCount: sum.LedgerTxns, LineCount: sum.Lines, PaymentCount: len(in.Payments),
+		SummaryJSON: string(summaryJSON), DurationMS: time.Since(start).Milliseconds(), Window: opt.Window,
 	}
 	runID, sync, err := s.store.SaveRun(ctx, run, res, evidence)
 	if err != nil {
@@ -176,11 +291,27 @@ func (s *Service) Run(ctx context.Context, opt RunOptions) (*Summary, error) {
 
 	counts := res.Counts()
 	s.metrics.RunFinished(time.Since(start), counts)
+	outside := map[string]int{}
+	for i := range res.Outcomes {
+		if o := &res.Outcomes[i]; o.Class == domain.ClassOutsideWindow {
+			outside[o.Provider]++
+		}
+	}
+	s.metrics.RunWindow(sum.Window, outside)
 	if c, err := s.store.ExceptionCounts(ctx); err == nil {
 		s.metrics.ExceptionsOpen(c[sqlite.StatusOpen])
 	}
-	s.log.Info("run complete", "run_id", runID, "ledger", len(in.Ledger), "lines", len(in.Lines), "discrepancies", sum.Discrepancies,
-		"opened", sync.Opened, "auto_closed", sync.AutoClosed, "duration_ms", timings["total"], "digest", digest)
+	attrs := []any{"run_id", runID, "ledger", sum.LedgerTxns, "lines", sum.Lines, "discrepancies", sum.Discrepancies,
+		"opened", sync.Opened, "auto_closed", sync.AutoClosed, "duration_ms", timings["total"], "digest", digest}
+	if w := sum.Window; w != nil {
+		attrs = append(attrs, "window", w.String(), "ledger_in_margin", w.LedgerInMargin, "lines_in_margin", w.LinesInMargin,
+			"groups_not_owned", w.GroupsNotOwned, "outside_window", w.OutsideWindow)
+		if w.OutsideWindow > 0 {
+			s.log.Warn("windowed run deferred groups whose counterpart is outside its margins", "run_id", runID,
+				"window", w.String(), "outside_window", w.OutsideWindow)
+		}
+	}
+	s.log.Info("run complete", attrs...)
 	return &sum, nil
 }
 
@@ -217,6 +348,8 @@ type Verification struct {
 	ReplayDigest   string `json:"replay_digest"`
 	Reproduced     bool   `json:"reproduced"`
 	ReplayDuration int64  `json:"replay_ms"`
+	// Window is the stored window the replay used (nil: full history).
+	Window *match.Window `json:"window,omitempty"`
 }
 
 // Verify re-runs a stored run from its recorded watermarks, as-of time and
@@ -232,18 +365,30 @@ func (s *Service) Verify(ctx context.Context, runID int64) (*Verification, error
 	if err != nil {
 		return nil, fmt.Errorf("stored config: %w", err)
 	}
-	in, err := s.store.LoadInputsAt(ctx, run.MaxFileID, run.MaxEventSeq)
+	// A windowed run replays with its stored window and the stored rules'
+	// timezones, and asks the same counterpart questions at its watermark.
+	// Verify never depends on the feature flag.
+	var in *sqlite.Inputs
+	if run.Window != nil {
+		in, err = s.store.LoadWindowAt(ctx, run.MaxFileID, run.MaxEventSeq, run.Window.Bounds(cfg))
+	} else {
+		in, err = s.store.LoadInputsAt(ctx, run.MaxFileID, run.MaxEventSeq)
+	}
 	if err != nil {
 		return nil, err
 	}
-	res, err := match.Reconcile(cfg, &match.Input{AsOf: run.AsOf, Ledger: in.Ledger, Lines: in.Lines, Payments: in.Payments})
+	mi := &match.Input{AsOf: run.AsOf, Ledger: in.Ledger, Lines: in.Lines, Payments: in.Payments}
+	if run.Window != nil {
+		mi.Window, mi.Prober = run.Window, s.store.Prober(ctx, run.MaxFileID)
+	}
+	res, err := match.Reconcile(cfg, mi)
 	if err != nil {
 		return nil, err
 	}
 	v := &Verification{
 		RunID: run.ID, EngineVersion: run.EngineVersion, CurrentEngine: match.EngineVersion,
 		InputDigest: run.InputDigest, InputMatches: in.Digest == run.InputDigest,
-		ResultDigest: run.ResultDigest, ReplayDigest: res.Digest(),
+		ResultDigest: run.ResultDigest, ReplayDigest: res.Digest(), Window: run.Window,
 	}
 	v.Reproduced = v.InputMatches && v.ReplayDigest == v.ResultDigest
 	v.ReplayDuration = time.Since(start).Milliseconds()

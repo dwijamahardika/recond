@@ -1,4 +1,4 @@
-.PHONY: build test test-race lint fmt vet bench bench-e2e fuzz demo serve docker clean
+.PHONY: build test test-race lint fmt vet bench bench-e2e rehearse fuzz demo serve docker clean
 
 BIN := bin
 
@@ -29,6 +29,11 @@ bench:
 bench-e2e:
 	scripts/bench.sh $(SIZES)
 
+## Launch rehearsal for windowed runs: upgrade from PREV_REF, windows vs full, cost.
+## N=100000 DAYS=28 SIZES="7 1" REPEAT=3 (docs/lifecycle/windowed-runs/07-launch-review.md)
+rehearse:
+	scripts/rehearse-windows.sh
+
 ## A short fuzzing pass over every parser (FUZZTIME per target).
 FUZZTIME ?= 20s
 fuzz:
@@ -46,4 +51,4 @@ docker:
 	docker build -t recond:dev .
 
 clean:
-	rm -rf $(BIN) demo-out bench-out reports cover.out
+	rm -rf $(BIN) demo-out bench-out rehearsal-out reports cover.out

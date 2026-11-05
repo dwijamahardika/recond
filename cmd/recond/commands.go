@@ -19,6 +19,7 @@ import (
 	"github.com/dwijamahardika/recond/internal/app"
 	"github.com/dwijamahardika/recond/internal/config"
 	"github.com/dwijamahardika/recond/internal/domain"
+	"github.com/dwijamahardika/recond/internal/match"
 )
 
 // ---- ingest ----
@@ -166,6 +167,10 @@ func cmdRun(ctx context.Context, args []string, out io.Writer) error {
 	var c common
 	fs := newFlags("run", &c, true)
 	asOf := fs.String("as-of", "", "reconcile as of this time (RFC 3339 or YYYY-MM-DD, UTC); default now")
+	from := fs.String("from", "", "window: first business date, YYYY-MM-DD, in each provider's timezone (needs RECOND_WINDOWED_RUNS=on)")
+	to := fs.String("to", "", "window: last business date, YYYY-MM-DD, inclusive")
+	behind := fs.Int("lookbehind", match.DefaultMarginDays, "window: days before -from read to find counterparts (1-31)")
+	ahead := fs.Int("lookahead", match.DefaultMarginDays, "window: days after -to read to find counterparts (1-31)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -173,12 +178,31 @@ func cmdRun(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	opt := app.RunOptions{AsOf: at}
+	switch {
+	case *from != "" || *to != "":
+		w := match.Window{Lookbehind: *behind, Lookahead: *ahead}
+		if err := w.From.UnmarshalText([]byte(*from)); err != nil || *from == "" {
+			return fmt.Errorf("-from %q: want YYYY-MM-DD", *from)
+		}
+		if err := w.To.UnmarshalText([]byte(*to)); err != nil || *to == "" {
+			return fmt.Errorf("-to %q: want YYYY-MM-DD", *to)
+		}
+		// Validate here: the service reads zero margins as "default", but a
+		// flag that defaults to 1 and is set to 0 is a request for 0.
+		if err := w.Validate(); err != nil {
+			return err
+		}
+		opt.Window = &w
+	case isSet(fs, "lookbehind") || isSet(fs, "lookahead"):
+		return errors.New("-lookbehind and -lookahead need -from and -to")
+	}
 	svc, store, err := open(ctx, c)
 	if err != nil {
 		return err
 	}
 	defer closeStore(store)
-	sum, err := svc.Run(ctx, app.RunOptions{AsOf: at})
+	sum, err := svc.Run(ctx, opt)
 	if err != nil {
 		return err
 	}
@@ -191,8 +215,22 @@ func cmdRun(ctx context.Context, args []string, out io.Writer) error {
 func printSummary(out io.Writer, s *app.Summary) error {
 	op := &printer{w: out}
 	op.f("run #%d  as of %s  engine v%s  rules %s\n", s.RunID, s.AsOf.Format(time.RFC3339), s.EngineVersion, s.ConfigSHA256[:12])
-	op.f("inputs: %s ledger txns, %s settlement lines, %s payments (files <= #%d, events <= #%d)\n\n",
-		num(s.LedgerTxns), num(s.Lines), num(s.Payments), s.MaxFileID, s.MaxEventSeq)
+	if w := s.Window; w != nil {
+		op.f("window %s: %d business day(s), each provider's own calendar\n", w.String(), w.Days)
+		for _, p := range w.Providers {
+			op.f("  %-8s %-7s %s .. %s\n", p.Provider, p.Timezone, p.From.Format(time.RFC3339), p.To.Format(time.RFC3339))
+		}
+		op.f("  dated in the window: %s ledger txns, %s settlement lines; read from the margin: %s / %s\n",
+			num(w.LedgerInWindow), num(w.LinesInWindow), num(w.LedgerInMargin), num(w.LinesInMargin))
+		op.f("  groups owned by neighbouring windows: %s; outside_window (counterpart beyond the margin): %s\n",
+			num(w.GroupsNotOwned), num(w.OutsideWindow))
+	}
+	reported := ""
+	if s.Window != nil {
+		reported = " reported (members of groups this window owns)"
+	}
+	op.f("inputs: %s ledger txns, %s settlement lines%s, %s payments (files <= #%d, events <= #%d)\n\n",
+		num(s.LedgerTxns), num(s.Lines), reported, num(s.Payments), s.MaxFileID, s.MaxEventSeq)
 	tw := tabwriter.NewWriter(out, 2, 4, 2, ' ', tabwriter.AlignRight)
 	tp := &printer{w: tw}
 	tp.ln("CLASS\tGROUPS\tLEDGER\tLINES\t|NET DIFF|\t")
@@ -270,6 +308,9 @@ func cmdVerify(ctx context.Context, args []string, out io.Writer) error {
 	} else {
 		op := &printer{w: out}
 		op.f("run #%d (engine v%s, now v%s)\n", v.RunID, v.EngineVersion, v.CurrentEngine)
+		if v.Window != nil {
+			op.f("  window  %s\n", v.Window)
+		}
 		op.f("  inputs  %s  %s\n", v.InputDigest[:16], okStr(v.InputMatches))
 		op.f("  result  %s  replay %s  %s\n", v.ResultDigest[:16], v.ReplayDigest[:16], okStr(v.ReplayDigest == v.ResultDigest))
 		op.f("  replayed in %dms from the event log and stored rules\n", v.ReplayDuration)
@@ -309,12 +350,31 @@ func cmdRuns(ctx context.Context, args []string, out io.Writer) error {
 	if c.json {
 		return json.NewEncoder(out).Encode(runs)
 	}
+	// The WINDOW column appears only when a listed run has one, so the
+	// listing of full-history runs is exactly what it was.
+	windowed := false
+	for _, r := range runs {
+		windowed = windowed || r.Window != nil
+	}
 	tw := tabwriter.NewWriter(out, 2, 4, 2, ' ', 0)
 	tp := &printer{w: tw}
-	tp.ln("RUN\tCREATED\tAS OF\tLEDGER\tLINES\tDISCREPANCIES\tMS\tDIGEST")
+	if windowed {
+		tp.ln("RUN\tCREATED\tAS OF\tWINDOW\tLEDGER\tLINES\tDISCREPANCIES\tMS\tDIGEST")
+	} else {
+		tp.ln("RUN\tCREATED\tAS OF\tLEDGER\tLINES\tDISCREPANCIES\tMS\tDIGEST")
+	}
 	for _, r := range runs {
 		var s app.Summary
 		_ = json.Unmarshal([]byte(r.SummaryJSON), &s)
+		if windowed {
+			win := "all"
+			if r.Window != nil {
+				win = fmt.Sprintf("%s..%s -%d/+%d", r.Window.From, r.Window.To, r.Window.Lookbehind, r.Window.Lookahead)
+			}
+			tp.f("%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", r.ID, r.CreatedAt.Format(time.RFC3339), r.AsOf.Format(time.RFC3339), win,
+				num(r.LedgerCount), num(r.LineCount), num(s.Discrepancies), r.DurationMS, r.ResultDigest[:12])
+			continue
+		}
 		tp.f("%d\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", r.ID, r.CreatedAt.Format(time.RFC3339), r.AsOf.Format(time.RFC3339),
 			num(r.LedgerCount), num(r.LineCount), num(s.Discrepancies), r.DurationMS, r.ResultDigest[:12])
 	}
@@ -539,6 +599,42 @@ func cmdConfig(args []string, out io.Writer) error {
 	enc := json.NewEncoder(out)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
+}
+
+// ---- migrations ----
+
+func cmdMigrations(ctx context.Context, args []string, out io.Writer) error {
+	var c common
+	fs := newFlags("migrations", &c, true)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	svc, store, err := open(ctx, c)
+	if err != nil {
+		return err
+	}
+	defer closeStore(store)
+	st, err := svc.SchemaStatus(ctx)
+	if err != nil {
+		return err
+	}
+	if c.json {
+		return json.NewEncoder(out).Encode(map[string]any{"schema": st, "windowed_runs_enabled": svc.WindowedRunsEnabled()})
+	}
+	op := &printer{w: out}
+	op.ln("applied schema migrations:")
+	for _, m := range st.Applied {
+		op.f("  %-22s %s\n", m.Version, m.AppliedAt.Format(time.RFC3339))
+	}
+	u := st.UndatedByState
+	op.f("exceptions without window_date: %d open, %d resolved, %d auto-closed\n", u[sqlite.StatusOpen], u[sqlite.StatusResolved], u[sqlite.StatusAutoClosed])
+	if u[sqlite.StatusOpen] == 0 {
+		op.ln("migrate phase: complete (no open exception is undated)")
+	} else {
+		op.ln("migrate phase: pending - run one full (unwindowed) run to date them")
+	}
+	op.f("windowed runs: %s\n", map[bool]string{true: "enabled", false: "disabled (RECOND_WINDOWED_RUNS)"}[svc.WindowedRunsEnabled()])
+	return op.err
 }
 
 // num formats an integer with thousands separators.

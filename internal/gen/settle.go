@@ -220,6 +220,9 @@ func (g *generator) settleBankB() {
 			due := domain.DateOf(x.paidAt, loc).AddDays(r.SettlementDays)
 			late := BankBEntry{ID: g.token(), ValueDate: due.AddDays(1 + g.rng.Intn(5)), TxnTime: x.paidAt, RefNo: x.ref,
 				Description: "QR CREDIT", Credit: x.exp.Net, Charges: x.exp.Fee}
+			if g.cfg.UntimedItemRate > 0 && g.rng.Float64() < g.cfg.UntimedItemRate {
+				late.TxnTime = time.Time{}
+			}
 			g.ds.BankB[late.ValueDate] = append(g.ds.BankB[late.ValueDate], late)
 			g.ds.Truth.Settles[x.ledger.ID] = late.ID
 			g.settledEvent(x, late.ValueDate)

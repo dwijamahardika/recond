@@ -31,19 +31,32 @@ type Score struct {
 	Unexplained []string `json:"unexplained,omitempty"`
 	Paired      int      `json:"pairs_checked"`
 	Mispaired   []string `json:"mispaired,omitempty"`
+	// Duplicated lists faults classified by more than one outcome: a
+	// discrepancy counted twice (for example by two windowed runs).
+	Duplicated []string `json:"duplicated,omitempty"`
+	// Deferred lists faults found only in outside_window outcomes: a
+	// windowed run saw the records but could not decide (margin too small).
+	// Neither detected nor missed.
+	Deferred         []string `json:"deferred,omitempty"`
+	DeferredOutcomes int      `json:"deferred_outcomes"`
 }
 
-// Perfect is the ground-truth property: every fault classified exactly, every
-// flag explained by a fault, every match pairing the right records.
+// Perfect is the ground-truth property: every fault classified exactly and
+// once, every flag explained by a fault, every match pairing the right
+// records, nothing deferred.
 func (s Score) Perfect() bool {
-	return s.Detected == s.Faults && len(s.Missed) == 0 && len(s.Unexplained) == 0 && len(s.Mispaired) == 0
+	return s.Detected == s.Faults && len(s.Missed) == 0 && len(s.Unexplained) == 0 && len(s.Mispaired) == 0 &&
+		len(s.Duplicated) == 0 && len(s.Deferred) == 0
 }
 
 func (s Score) String() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "faults %d, detected %d; flagged outcomes %d, unexplained %d; pairs checked %d, mispaired %d",
 		s.Faults, s.Detected, s.Flagged, len(s.Unexplained), s.Paired, len(s.Mispaired))
-	for _, list := range [][]string{s.Missed, s.Unexplained, s.Mispaired} {
+	if len(s.Duplicated) > 0 || len(s.Deferred) > 0 || s.DeferredOutcomes > 0 {
+		fmt.Fprintf(&b, "; duplicated %d; deferred %d (%d outside_window outcomes)", len(s.Duplicated), len(s.Deferred), s.DeferredOutcomes)
+	}
+	for _, list := range [][]string{s.Missed, s.Unexplained, s.Mispaired, s.Duplicated, s.Deferred} {
 		for i, m := range list {
 			if i == 10 {
 				fmt.Fprintf(&b, "\n  ... %d more", len(list)-10)
@@ -70,26 +83,39 @@ func ScoreOutcomes(t *Truth, outs []Scored) Score {
 	faultsByKey := map[string][]Fault{}
 	for _, f := range t.Faults {
 		faultsByKey[f.Key] = append(faultsByKey[f.Key], f)
-		found := false
+		found, deferred := 0, false
 		var got []string
 		for _, i := range byKey[f.Key] {
 			o := outs[i]
 			got = append(got, string(o.Class)+"/"+string(o.Rule))
+			if o.Class == domain.ClassOutsideWindow {
+				deferred = true
+			}
 			if o.Class != f.Class {
 				continue
 			}
 			if f.Kind == FaultCorruptReference && (!contains(o.Ledger, f.LedgerID) || !contains(o.Lines, f.LineID)) {
 				continue
 			}
-			found = true
+			found++
 		}
-		if found {
+		switch {
+		case found > 0:
 			s.Detected++
-		} else {
+			if found > 1 {
+				s.Duplicated = append(s.Duplicated, fmt.Sprintf("%s %s: %s in %d outcomes %v", f.Kind, f.Key, f.Class, found, got))
+			}
+		case deferred:
+			s.Deferred = append(s.Deferred, fmt.Sprintf("%s %s: want %s, deferred %v", f.Kind, f.Key, f.Class, got))
+		default:
 			s.Missed = append(s.Missed, fmt.Sprintf("%s %s: want %s, got %v", f.Kind, f.Key, f.Class, got))
 		}
 	}
 	for _, o := range outs {
+		if o.Class == domain.ClassOutsideWindow {
+			s.DeferredOutcomes++
+			continue
+		}
 		if o.Class == domain.ClassMatched {
 			continue
 		}
@@ -120,6 +146,8 @@ func ScoreOutcomes(t *Truth, outs []Scored) Score {
 		}
 	}
 	sort.Strings(s.Missed)
+	sort.Strings(s.Deferred)
+	sort.Strings(s.Duplicated)
 	return s
 }
 

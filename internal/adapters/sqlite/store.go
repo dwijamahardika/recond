@@ -42,7 +42,12 @@ type Store struct {
 // The page cache is capped at 256 MiB: ingestion inserts into indexes keyed by
 // random ids, and a cache smaller than those indexes turns every insert into
 // disk reads.
-func Open(ctx context.Context, path string) (*Store, error) {
+func Open(ctx context.Context, path string) (*Store, error) { return openUpTo(ctx, path, "") }
+
+// openUpTo opens the database and applies migrations up to and including
+// version last ("" = all). Tests use last to build a database the way an
+// earlier release left it.
+func openUpTo(ctx context.Context, path, last string) (*Store, error) {
 	q := url.Values{}
 	for _, p := range []string{"journal_mode(WAL)", "synchronous(NORMAL)", "foreign_keys(ON)", "busy_timeout(10000)", "cache_size(-262144)", "temp_store(MEMORY)"} {
 		q.Add("_pragma", p)
@@ -59,7 +64,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("open %s: %w", path, err)
 	}
-	if err := s.migrate(ctx); err != nil {
+	if err := s.migrate(ctx, last); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
@@ -73,8 +78,9 @@ func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
 // migrate applies embedded SQL files in lexical order, each in its own
-// transaction. Forward-only: a fix is a new migration, never an edit.
-func (s *Store) migrate(ctx context.Context) error {
+// transaction, stopping after version last ("" = all). Forward-only: a fix is
+// a new migration, never an edit.
+func (s *Store) migrate(ctx context.Context, last string) error {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -96,6 +102,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		version := strings.TrimSuffix(name, ".sql")
 		if err := s.applyMigration(ctx, version, name); err != nil {
 			return fmt.Errorf("%s: %w", version, err)
+		}
+		if version == last {
+			break
 		}
 	}
 	return nil
@@ -163,4 +172,54 @@ func boolInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// AppliedMigration is one row of schema_migrations.
+type AppliedMigration struct {
+	Version   string    `json:"version"`
+	AppliedAt time.Time `json:"applied_at"`
+}
+
+// SchemaStatus reports the applied migrations and the progress of the
+// windowed-runs "migrate" phase: exceptions not yet dated by a run of this
+// release, by status (docs/lifecycle/windowed-runs/04-migration-plan.md).
+type SchemaStatus struct {
+	Applied        []AppliedMigration `json:"applied"`
+	UndatedByState map[string]int     `json:"exceptions_without_window_date"`
+}
+
+// SchemaStatus reads the schema state. It only reads.
+func (s *Store) SchemaStatus(ctx context.Context) (SchemaStatus, error) {
+	st := SchemaStatus{UndatedByState: map[string]int{StatusOpen: 0, StatusResolved: 0, StatusAutoClosed: 0}}
+	rows, err := s.db.QueryContext(ctx, `SELECT version, applied_at FROM schema_migrations ORDER BY version`)
+	if err != nil {
+		return st, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var m AppliedMigration
+		var at int64
+		if err := rows.Scan(&m.Version, &at); err != nil {
+			return st, err
+		}
+		m.AppliedAt = fromNanos(at)
+		st.Applied = append(st.Applied, m)
+	}
+	if err := rows.Err(); err != nil {
+		return st, err
+	}
+	counts, err := s.db.QueryContext(ctx, `SELECT status, count(*) FROM exceptions WHERE window_date IS NULL GROUP BY status`)
+	if err != nil {
+		return st, err
+	}
+	defer func() { _ = counts.Close() }()
+	for counts.Next() {
+		var status string
+		var n int
+		if err := counts.Scan(&status, &n); err != nil {
+			return st, err
+		}
+		st.UndatedByState[status] = n
+	}
+	return st, counts.Err()
 }

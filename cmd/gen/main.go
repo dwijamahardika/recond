@@ -4,6 +4,10 @@
 //
 //	gen -out data -n 10000 -seed 1
 //	gen score -truth data/truth.json -items reports/run-1/items.csv
+//	gen score -truth data/truth.json -items reports/run-2/items.csv -items reports/run-3/items.csv
+//
+// Several -items files are scored as one result: consecutive windowed runs
+// must together classify every fault exactly once.
 //
 // All data is synthetic: fictional providers (psp_a, bank_b), random IDs and
 // order references, no real people, merchants or accounts.
@@ -48,6 +52,7 @@ func generate(args []string) error {
 	faultRate := fs.Float64("fault-rate", 0.03, "fraction of psp_a transactions given an item fault")
 	batchRate := fs.Float64("batch-fault-rate", 0.25, "fraction of bank_b payouts given a batch fault")
 	dupRate := fs.Float64("dup-rate", 0.15, "fraction of webhook events delivered twice")
+	untimed := fs.Float64("untimed-item-rate", 0, "fraction of bank_b late item credits written without a transaction time")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -60,7 +65,7 @@ func generate(args []string) error {
 		return err
 	}
 	cfg := gen.Config{Seed: *seed, Payments: *n, Start: day, Days: *days, Rules: rules,
-		FaultRate: *faultRate, BatchFaultRate: *batchRate, DupEventRate: *dupRate}
+		FaultRate: *faultRate, BatchFaultRate: *batchRate, DupEventRate: *dupRate, UntimedItemRate: *untimed}
 	switch *faults {
 	case "all":
 	case "none":
@@ -137,14 +142,21 @@ func sortedCounts(m map[string]int) string {
 	return strings.Join(parts, " ")
 }
 
+// files is a repeatable string flag.
+type files []string
+
+func (f *files) String() string     { return strings.Join(*f, ",") }
+func (f *files) Set(v string) error { *f = append(*f, v); return nil }
+
 func score(args []string) error {
 	fs := flag.NewFlagSet("gen score", flag.ContinueOnError)
 	truthPath := fs.String("truth", "data/truth.json", "truth.json written by gen")
-	itemsPath := fs.String("items", "", "items.csv written by recond report")
+	var itemsPaths files
+	fs.Var(&itemsPaths, "items", "items.csv written by recond report (repeat to score several runs as one, e.g. consecutive windows)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *itemsPath == "" {
+	if len(itemsPaths) == 0 {
 		return errors.New("-items required")
 	}
 	b, err := os.ReadFile(*truthPath)
@@ -155,14 +167,16 @@ func score(args []string) error {
 	if err := json.Unmarshal(b, &truth); err != nil {
 		return fmt.Errorf("%s: %w", *truthPath, err)
 	}
-	f, err := os.Open(*itemsPath)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-	outs, err := gen.ScoredFromItemsCSV(f)
-	if err != nil {
-		return err
+	var outs []gen.Scored
+	for _, p := range itemsPaths {
+		got, err := readItems(p)
+		if err != nil {
+			return err
+		}
+		for _, o := range got {
+			o.ID += len(outs) // outcome ids are per run: keep them distinct across files
+			outs = append(outs, o)
+		}
 	}
 	s := gen.ScoreOutcomes(&truth, outs)
 	got := map[domain.Class]int{}
@@ -177,10 +191,22 @@ func score(args []string) error {
 			fmt.Printf("%-22s %8d %8d\n", c, truth.Expected[c], got[c])
 		}
 	}
+	if s.DeferredOutcomes > 0 {
+		fmt.Printf("%-22s %8s %8d\n", domain.ClassOutsideWindow, "-", s.DeferredOutcomes)
+	}
 	fmt.Println(s.String())
 	if !s.Perfect() {
 		return errors.New("report does not match ground truth")
 	}
 	fmt.Println("every injected fault classified exactly; nothing clean flagged")
 	return nil
+}
+
+func readItems(path string) ([]gen.Scored, error) {
+	f, err := os.Open(path) //nolint:gosec // operator-supplied report path
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	return gen.ScoredFromItemsCSV(f)
 }

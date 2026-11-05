@@ -32,6 +32,9 @@ type Metrics interface {
 	Webhook(provider, result string)
 	Ingested(kind string, rows int)
 	RunFinished(d time.Duration, counts map[domain.Class]int)
+	// RunWindow follows RunFinished: w is nil for a full-history run;
+	// outside counts outside_window groups by provider.
+	RunWindow(w *WindowSummary, outside map[string]int)
 	ExceptionsOpen(n int)
 }
 
@@ -40,19 +43,29 @@ type noMetrics struct{}
 func (noMetrics) Webhook(string, string)                          {}
 func (noMetrics) Ingested(string, int)                            {}
 func (noMetrics) RunFinished(time.Duration, map[domain.Class]int) {}
+func (noMetrics) RunWindow(*WindowSummary, map[string]int)        {}
 func (noMetrics) ExceptionsOpen(int)                              {}
 
 // Service is the application layer used by the CLI and the HTTP API.
 type Service struct {
-	store   *sqlite.Store
-	rules   *match.Config
-	clock   clock.Clock
-	log     *slog.Logger
-	metrics Metrics
+	store    *sqlite.Store
+	rules    *match.Config
+	clock    clock.Clock
+	log      *slog.Logger
+	metrics  Metrics
+	windowed bool // feature flag: may windowed runs be created
 }
 
+// Option configures a Service.
+type Option func(*Service)
+
+// WithWindowedRuns sets the windowed-runs feature flag (RECOND_WINDOWED_RUNS).
+// It gates creating windowed runs only: a stored windowed run always
+// verifies, so switching the flag off strands nothing.
+func WithWindowedRuns(on bool) Option { return func(s *Service) { s.windowed = on } }
+
 // NewService wires a service; clk, log and m may be nil.
-func NewService(store *sqlite.Store, rules *match.Config, clk clock.Clock, log *slog.Logger, m Metrics) *Service {
+func NewService(store *sqlite.Store, rules *match.Config, clk clock.Clock, log *slog.Logger, m Metrics, opts ...Option) *Service {
 	if clk == nil {
 		clk = clock.System{}
 	}
@@ -62,7 +75,19 @@ func NewService(store *sqlite.Store, rules *match.Config, clk clock.Clock, log *
 	if m == nil {
 		m = noMetrics{}
 	}
-	return &Service{store: store, rules: rules, clock: clk, log: log, metrics: m}
+	s := &Service{store: store, rules: rules, clock: clk, log: log, metrics: m}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+// WindowedRunsEnabled reports the feature flag.
+func (s *Service) WindowedRunsEnabled() bool { return s.windowed }
+
+// SchemaStatus reports applied migrations and the window_date backfill.
+func (s *Service) SchemaStatus(ctx context.Context) (sqlite.SchemaStatus, error) {
+	return s.store.SchemaStatus(ctx)
 }
 
 // Rules returns the provider rules in effect.
@@ -72,6 +97,9 @@ func (s *Service) Rules() *match.Config { return s.rules }
 var (
 	ErrUnknownProvider = errors.New("unknown provider")
 	ErrValidation      = errors.New("validation")
+	// ErrWindowedRunsDisabled: a windowed run was requested with the
+	// feature flag off.
+	ErrWindowedRunsDisabled = errors.New("windowed runs are disabled (set RECOND_WINDOWED_RUNS=on)")
 )
 
 // Source is an input file. Open may be called twice (hash, then parse).
