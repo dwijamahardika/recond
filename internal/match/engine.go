@@ -131,6 +131,11 @@ func Reconcile(cfg *Config, in *Input) (*Result, error) {
 		return nil, err
 	}
 	e.byReference()
+	if win != nil {
+		if err := e.deferByReference(win); err != nil {
+			return nil, fmt.Errorf("counterpart lookup: %w", err)
+		}
+	}
 	e.refunded()
 	e.byTolerance()
 	e.batches()

@@ -229,9 +229,9 @@ func TestOutsideWindow(t *testing.T) {
 	}
 	t.Run("counterpart beyond the lookahead is attached and deferred", func(t *testing.T) {
 		res := runW(t, lateUntimed(), win(0, 6))
-		assertOutcomes(t, res, expect{"outside_window", "unmatched", "t1", "bank_b:L1"})
+		assertOutcomes(t, res, expect{"outside_window", "reference", "t1", "bank_b:L1"})
 		o := res.Outcomes[0]
-		for _, want := range []string{"bank_b:L1", "dated 2026-10-11", "2026-09-30..2026-10-08", "would be missing_in_settlement", "-lookahead"} {
+		for _, want := range []string{"bank_b:L1", "dated 2026-10-11", "2026-09-30..2026-10-08", "(attached)", "pairs by reference", "-lookahead"} {
 			if !strings.Contains(o.Detail, want) {
 				t.Errorf("detail %q lacks %q", o.Detail, want)
 			}
@@ -260,8 +260,8 @@ func TestOutsideWindow(t *testing.T) {
 		}
 		assertOutcomes(t, runW(t, in(), win(7, 13)))
 		res := runW(t, in(), win(0, 6))
-		assertOutcomes(t, res, expect{"outside_window", "unmatched", "t1", "psp_a:S1"})
-		if !strings.Contains(res.Outcomes[0].Detail, "would be missing_in_ledger") {
+		assertOutcomes(t, res, expect{"outside_window", "reference", "t1", "psp_a:S1"})
+		if !strings.Contains(res.Outcomes[0].Detail, "ledger transaction t1 dated 2026-10-09") {
 			t.Fatal(res.Outcomes[0].Detail)
 		}
 	})
@@ -274,7 +274,7 @@ func TestOutsideWindow(t *testing.T) {
 		}
 		res := runW(t, in, win(0, 6))
 		assertOutcomes(t, res, expect{"outside_window", "unmatched", "t1", ""})
-		if !strings.Contains(res.Outcomes[0].Detail, "not attached") {
+		if d := res.Outcomes[0].Detail; !strings.Contains(d, "not attached") || !strings.Contains(d, "would be missing_in_settlement") {
 			t.Fatal(res.Outcomes[0].Detail)
 		}
 	})
@@ -309,7 +309,7 @@ func TestOutsideWindow(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		assertOutcomes(t, res, expect{"outside_window", "unmatched", "t1", "bank_b:L1"}, expect{"missing_in_ledger", "unmatched", "", "psp_a:S9"})
+		assertOutcomes(t, res, expect{"outside_window", "reference", "t1", "bank_b:L1"}, expect{"missing_in_ledger", "unmatched", "", "psp_a:S9"})
 		if spare := lines[:2][1]; spare.ID != "" || len(in.Lines) != 1 {
 			t.Fatalf("caller's slice was written: %+v", spare)
 		}

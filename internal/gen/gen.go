@@ -68,7 +68,14 @@ type Config struct {
 	// "pending" with a fresh event id and a later timestamp after payment.
 	// Only the transition rules - not event ordering - can reject it.
 	StaleResendRate float64 // default 0.03
-	CycleHours      int     // bank_b payout cycle (default 6)
+	// UntimedItemRate: bank_b late item credits (item_delay) written
+	// without a transaction time, as the format allows. A windowed run then
+	// dates them by settlement (settled_on - N), days after their
+	// transaction, which is what exercises window margins. Default 0; the
+	// random stream is only drawn from when it is positive, so worlds
+	// generated without it are unchanged.
+	UntimedItemRate float64
+	CycleHours      int // bank_b payout cycle (default 6)
 	Faults          map[string]bool
 }
 
@@ -99,6 +106,7 @@ func (c *Config) defaults() error {
 	def(&c.DupEventRate, 0.15)
 	def(&c.BoundaryRate, 0.02)
 	def(&c.StaleResendRate, 0.03)
+	c.UntimedItemRate = max(c.UntimedItemRate, 0)
 	if c.CycleHours <= 0 || 24%c.CycleHours != 0 {
 		c.CycleHours = 6
 	}
