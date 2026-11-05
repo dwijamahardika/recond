@@ -60,3 +60,21 @@ func TestRulesFile(t *testing.T) {
 		t.Fatal("unknown fields must be rejected")
 	}
 }
+
+func TestWindowedRunsFlag(t *testing.T) {
+	for v, want := range map[string]bool{"": DefaultWindowedRuns, "on": true, "TRUE": true, "1": true, "off": false, "false": false, "0": false} {
+		t.Setenv("RECOND_WINDOWED_RUNS", v)
+		got, err := WindowedRuns()
+		if err != nil || got != want {
+			t.Errorf("%q: %v %v, want %v", v, got, err, want)
+		}
+		c, err := Load()
+		if err != nil || c.WindowedRuns != want {
+			t.Errorf("Load with %q: %+v %v", v, c, err)
+		}
+	}
+	t.Setenv("RECOND_WINDOWED_RUNS", "maybe")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "RECOND_WINDOWED_RUNS") {
+		t.Fatalf("a typo must fail at start, got %v", err)
+	}
+}

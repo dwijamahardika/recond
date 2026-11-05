@@ -38,8 +38,31 @@ type Config struct {
 	// deliver webhooks (fail closed).
 	WebhookSecrets   map[string][]byte
 	WebhookTolerance time.Duration
+	// WindowedRuns gates creating windowed runs (RECOND_WINDOWED_RUNS).
+	// Verifying a stored windowed run never depends on it.
+	WindowedRuns bool
 
 	Rules *match.Config
+}
+
+// DefaultWindowedRuns is the feature flag's value when RECOND_WINDOWED_RUNS
+// is unset (docs/lifecycle/windowed-runs/05-rollout-plan.md).
+const DefaultWindowedRuns = false
+
+// WindowedRuns reads the RECOND_WINDOWED_RUNS feature flag: on/off,
+// true/false, 1/0; unset means DefaultWindowedRuns. Anything else is an
+// error, so a typo fails at start instead of silently picking a side.
+func WindowedRuns() (bool, error) {
+	switch v := strings.ToLower(strings.TrimSpace(os.Getenv("RECOND_WINDOWED_RUNS"))); v {
+	case "":
+		return DefaultWindowedRuns, nil
+	case "on", "true", "1":
+		return true, nil
+	case "off", "false", "0":
+		return false, nil
+	default:
+		return false, fmt.Errorf("RECOND_WINDOWED_RUNS=%q: want on or off", v)
+	}
 }
 
 // MinSecretLen rejects secrets too short to be worth the HMAC.
@@ -94,6 +117,9 @@ func Load() (*Config, error) {
 			}
 			c.WebhookSecrets[name] = []byte(v)
 		}
+	}
+	if c.WindowedRuns, err = WindowedRuns(); err != nil {
+		errs = append(errs, err)
 	}
 	if c.WebhookTolerance <= 0 || c.WebhookTolerance > time.Hour {
 		errs = append(errs, errors.New("RECOND_WEBHOOK_TOLERANCE must be in (0, 1h]"))
