@@ -21,7 +21,7 @@
 | Boundary records reported by the wrong window | `TestWindowOwnership` (table: last millisecond of `to`, first of `to+1`, ledger booked after midnight, late settlement, margin-only groups) | match |
 | Counterpart beyond reach reported as missing | `TestOutsideWindow` (table: beyond lookahead, beyond lookbehind, attached when unique, alone when the reference is ambiguous, payout counterpart, no counterpart → still `missing_*`) | match |
 | Window validation | `TestWindowValidate` (`to < from`, margins 0 and 32, 367-day window, zero dates) | match |
-| Storage superset misses a visible record | `TestWindowBoundsCoverVisibleRange` (bounds vs per-provider instants) and `TestWindowLoadMatchesInMemory` (SQL load + engine == in-memory engine, by digest) | match, sqlite |
+| Storage superset misses a visible record | `TestWindowBoundsCoverVisibleRange` (bounds vs per-provider instants) and `TestWindowLoadMatchesFullLoad` (SQL load + engine == in-memory engine, by digest, current and replay) | match, sqlite |
 | **M1/G1: consecutive windows ≠ full run** | `TestWindowedRunsPartitionFullRun`: 8 seeds (2 with `-short`) × window sizes 1, 2, 3 and 7 days, default margins, boundary rate 5%. Asserts the multiset of groups (class, rule, members, amounts, dates, detail) across windows equals the full run's, zero `outside_window`, and the ground-truth scorer is perfect over the union. | gen (property) |
 | **M2/G2: undersized margins → false or double discrepancies** | `TestWindowedRunsDeferWhenMarginTooSmall`: untimed late item credits (spread 1–5 days) with margins 1/1, 1/3 and 3/1. Asserts every full-run group appears exactly once across windows, either unchanged or as `outside_window` with the same members; 0 unexplained flags; 0 faults counted twice; and with margins 5/5, exact equality. | gen (property) |
 | Scorer can't see double counting | `TestScoreCountsDuplicatesAndDeferrals` | gen |
@@ -35,6 +35,19 @@
 | Flag gates creation only | `TestWindowedRunsRequireFlag` (service), CLI and HTTP flag-off cases; verify of a windowed run with the flag off still passes | app, cli, httpapi |
 | CLI and API contract | `TestCLIWindowedRun`, `TestWindowedRunsOverHTTP` (201 + window in summary, 400 on invalid window and when disabled, verify reproduces, metrics exposed) | cli, httpapi |
 | G3 known limit | `TestKnownLimitToleranceSpreadBeyondMargin` (characterisation) | match |
+
+Added during the build, beyond the original plan:
+
+| Risk | Test | Level |
+|---|---|---|
+| Windowed run without a prober, invalid window, unknown provider in a window | `TestWindowNeedsProberAndValidWindow` | match |
+| Probe key disagrees with SQLite's `upper(trim(x))` | `TestProbeKey`, plus the check inside `TestProberNormalisesReferences` | match, sqlite |
+| Exception dates differ between full and windowed runs | `TestAnchorDate` | match |
+| Attaching counterparts is quadratic (found by the launch rehearsal) | `TestAttachIsAmortised`: fails at 2,773 MiB on the old code | match |
+| Window lost on the run record | `TestRunWindowRoundTrip` | sqlite |
+| A window query falls back to a full scan | `TestWindowQueriesUseIndexes` (pins the query plans) | sqlite |
+| Deferrals invisible to monitoring | `TestOutsideWindowReachesMetrics` | app |
+| Flag parsing (typos must fail at start) | `TestWindowedRunsFlag` | config |
 
 ## Generator extensions
 
