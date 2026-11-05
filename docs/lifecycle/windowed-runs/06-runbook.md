@@ -67,16 +67,16 @@ The detail names the counterpart, its date and the margin to widen: `counterpart
 Usual causes, most likely first:
 
 1. **Settlement lines without a transaction time that settled late** (bank_b allows an empty `txn_datetime`). They are dated `settled_on − N`, so k days late means dated k days later. Fix: re-run the window with `-lookahead k`.
-2. **Ledger rows booked days after the provider's time** (manual postings). Check with `recond payment PROVIDER REF`: compare `paid_at` with the ledger row's `created_at` in the evidence. Fix: `-lookbehind` or `-lookahead` to cover the delay.
+2. **Ledger rows booked days after the provider's time** (manual postings). The detail gives the counterpart's window date, which for a ledger row is its booking date. Compare it with `paid_at` from `recond payment PROVIDER REF`. (`outside_window` is not a discrepancy, so no evidence is stored for it.) Fix: `-lookbehind` or `-lookahead` to cover the delay.
 3. **Reused references.** The detail says `not attached: reference not unique`. Look the reference up with `recond payment`. This is a data problem upstream, not a window problem.
 
-Re-running a wider window is safe. Runs are immutable and the exception queue de-duplicates by fingerprint. Exceptions of records deferred as `outside_window` are **kept open** (`kept_open_deferred` in the summary's exception block) until a run can decide.
+Re-running a wider window is safe. Runs are immutable and the exception queue de-duplicates by fingerprint. Exceptions of records deferred as `outside_window` are **kept open** (counted as `kept_open_deferred` in the run's JSON summary, `recond run -json` or `summary.json`) until a run can decide.
 
 ### B. `verify` reports MISMATCH for a windowed run
 
 ```bash
-recond verify ID -json        # window, input_matches, digests, engine versions
-recond runs                   # which binary/engine made it, when
+recond verify ID -json        # window, input_matches, digests, engine_version vs current_engine
+recond runs -json             # engine_version, window and created_at of every run
 ```
 
 - `engine_version` differs from `current_engine`: the engine changed between the run and now. Expected after an upgrade that bumps it. Re-run the window if you need a current verdict.
@@ -88,7 +88,7 @@ recond runs                   # which binary/engine made it, when
 
 ```bash
 recond exceptions -status auto_closed -limit 20
-recond exceptions show ID     # audit trail: "auto_closed by recond: not present in run N"
+recond exceptions show ID     # audit trail line: "auto_closed  by recond  not present in run N"
 recond runs                   # run N's WINDOW
 ```
 
