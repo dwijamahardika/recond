@@ -6,6 +6,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
+	"github.com/dwijamahardika/recond/internal/app"
 	"github.com/dwijamahardika/recond/internal/domain"
 )
 
@@ -21,6 +22,14 @@ type Metrics struct {
 	runSeconds prometheus.Histogram
 	outcomes   *prometheus.GaugeVec
 	open       prometheus.Gauge
+
+	// Windowed runs (docs/lifecycle/windowed-runs/06-runbook.md).
+	windowedRuns   prometheus.Counter
+	windowDays     prometheus.Gauge
+	windowRecords  *prometheus.GaugeVec
+	windowNotOwned prometheus.Gauge
+	outsideTotal   *prometheus.CounterVec
+	lastOutside    prometheus.Gauge
 }
 
 // NewMetrics creates and registers the metrics.
@@ -40,8 +49,24 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 		outcomes: prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: "recond", Name: "last_run_outcomes",
 			Help: "Outcomes of the most recent run, by class."}, []string{"class"}),
 		open: prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "recond", Name: "exceptions_open"}),
+
+		windowedRuns: prometheus.NewCounter(prometheus.CounterOpts{Namespace: "recond", Name: "windowed_runs_total",
+			Help: "Windowed runs completed."}),
+		windowDays: prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "recond", Name: "last_run_window_days",
+			Help: "Business days in the most recent run's window; 0 for a full-history run."}),
+		windowRecords: prometheus.NewGaugeVec(prometheus.GaugeOpts{Namespace: "recond", Name: "last_run_window_records",
+			Help: "Records the most recent windowed run read, by record (ledger|line) and scope: window (dated inside it) or margin (read only to find counterparts, not reported)."},
+			[]string{"record", "scope"}),
+		windowNotOwned: prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "recond", Name: "last_run_window_groups_not_owned",
+			Help: "Groups the most recent windowed run computed for boundary records but left to the neighbouring window that owns them."}),
+		outsideTotal: prometheus.NewCounterVec(prometheus.CounterOpts{Namespace: "recond", Name: "outside_window_total",
+			Help: "Groups deferred as outside_window: a counterpart lies beyond the run's margins. Stays 0 with adequate margins."},
+			[]string{"provider"}),
+		lastOutside: prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "recond", Name: "last_run_outside_window",
+			Help: "outside_window groups in the most recent run."}),
 	}
-	reg.MustRegister(m.requests, m.latency, m.webhooks, m.ingested, m.runs, m.runSeconds, m.outcomes, m.open)
+	reg.MustRegister(m.requests, m.latency, m.webhooks, m.ingested, m.runs, m.runSeconds, m.outcomes, m.open,
+		m.windowedRuns, m.windowDays, m.windowRecords, m.windowNotOwned, m.outsideTotal, m.lastOutside)
 	return m
 }
 
@@ -63,6 +88,29 @@ func (m *Metrics) Ingested(kind string, rows int) {
 
 // ExceptionsOpen sets the open exception gauge.
 func (m *Metrics) ExceptionsOpen(n int) { m.open.Set(float64(n)) }
+
+// RunWindow records how a window shaped the most recent run (nil: a
+// full-history run, which resets the last-run window gauges).
+func (m *Metrics) RunWindow(w *app.WindowSummary, outside map[string]int) {
+	if w == nil {
+		m.windowDays.Set(0)
+		m.windowNotOwned.Set(0)
+		m.lastOutside.Set(0)
+		m.windowRecords.Reset()
+		return
+	}
+	m.windowedRuns.Inc()
+	m.windowDays.Set(float64(w.Days))
+	m.windowRecords.WithLabelValues("ledger", "window").Set(float64(w.LedgerInWindow))
+	m.windowRecords.WithLabelValues("ledger", "margin").Set(float64(w.LedgerInMargin))
+	m.windowRecords.WithLabelValues("line", "window").Set(float64(w.LinesInWindow))
+	m.windowRecords.WithLabelValues("line", "margin").Set(float64(w.LinesInMargin))
+	m.windowNotOwned.Set(float64(w.GroupsNotOwned))
+	m.lastOutside.Set(float64(w.OutsideWindow))
+	for p, n := range outside {
+		m.outsideTotal.WithLabelValues(p).Add(float64(n))
+	}
+}
 
 // RunFinished records a completed run and its outcome counts.
 func (m *Metrics) RunFinished(d time.Duration, counts map[domain.Class]int) {

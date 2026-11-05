@@ -218,3 +218,49 @@ func TestWindowedRunScopesExceptionQueue(t *testing.T) {
 		t.Fatalf("nothing left for a full run to close: %+v %v", last, err)
 	}
 }
+
+// recorder captures the window metrics a run reports.
+type recorder struct {
+	windows []*app.WindowSummary
+	outside map[string]int
+}
+
+func (*recorder) Webhook(string, string)                          {}
+func (*recorder) Ingested(string, int)                            {}
+func (*recorder) RunFinished(time.Duration, map[domain.Class]int) {}
+func (*recorder) ExceptionsOpen(int)                              {}
+func (r *recorder) RunWindow(w *app.WindowSummary, outside map[string]int) {
+	r.windows = append(r.windows, w)
+	for p, n := range outside {
+		r.outside[p] += n
+	}
+}
+
+// A window too narrow for untimed late credits reports its deferrals to
+// metrics by provider; that is the signal the runbook alerts on.
+func TestOutsideWindowReachesMetrics(t *testing.T) {
+	ctx := context.Background()
+	cfg := gen.Config{Seed: 2, Payments: 1500, Days: 4, FaultRate: -1, BatchFaultRate: 1, UntimedItemRate: 1,
+		Faults: map[string]bool{gen.FaultItemDelay: true}}
+	w := newWorld(t, cfg)
+	w.ingestAll(t)
+	rec := &recorder{outside: map[string]int{}}
+	svc := app.NewService(w.store, w.ds.Rules, clock.NewFake(w.ds.Truth.AsOf), nil, rec, app.WithWindowedRuns(true))
+	deferred := 0
+	for _, win := range days(w.ds, 1, cfg) {
+		sum, err := svc.Run(ctx, app.RunOptions{AsOf: w.ds.Truth.AsOf, Window: &win})
+		if err != nil {
+			t.Fatal(err)
+		}
+		deferred += sum.Window.OutsideWindow
+	}
+	if _, err := svc.Run(ctx, app.RunOptions{AsOf: w.ds.Truth.AsOf}); err != nil {
+		t.Fatal(err)
+	}
+	if deferred == 0 || rec.outside["bank_b"] != deferred || len(rec.outside) != 1 {
+		t.Fatalf("deferred %d, metrics %v", deferred, rec.outside)
+	}
+	if n := len(rec.windows); n < 2 || rec.windows[n-1] != nil || rec.windows[0] == nil {
+		t.Fatalf("a full run reports a nil window, windowed runs their summary: %v", rec.windows)
+	}
+}

@@ -131,7 +131,7 @@ Omitted or zero margins mean the default of 1. With the flag off, a request carr
 
 ## 11. Feature flag
 
-`RECOND_WINDOWED_RUNS=on|off` (also `true/false/1/0`). It gates **creating** windowed runs only. `verify` of a stored windowed run always works, so turning the flag off is a safe rollback that strands nothing. The schema migration and the `window_date` dual write are not gated: they are the expand step, invisible to every existing command.
+`RECOND_WINDOWED_RUNS=on|off` (also `true/false/1/0`). It gates **creating** windowed runs only. `verify` of a stored windowed run always works, so turning the flag off is a safe rollback that strands nothing. The schema migration and the `window_date` dual write are not gated: they are the expand step, invisible to every existing command. The one flag-off change an operator can observe is on `/metrics`. The new series are registered at start-up and read zero until a windowed run happens, which follows the Prometheus advice to initialise series rather than let them appear late.
 
 ## 12. Metrics
 

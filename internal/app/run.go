@@ -291,6 +291,13 @@ func (s *Service) Run(ctx context.Context, opt RunOptions) (*Summary, error) {
 
 	counts := res.Counts()
 	s.metrics.RunFinished(time.Since(start), counts)
+	outside := map[string]int{}
+	for i := range res.Outcomes {
+		if o := &res.Outcomes[i]; o.Class == domain.ClassOutsideWindow {
+			outside[o.Provider]++
+		}
+	}
+	s.metrics.RunWindow(sum.Window, outside)
 	if c, err := s.store.ExceptionCounts(ctx); err == nil {
 		s.metrics.ExceptionsOpen(c[sqlite.StatusOpen])
 	}

@@ -84,5 +84,22 @@ func TestWindowedRunsOverHTTP(t *testing.T) {
 			!strings.Contains(body, `"reproduced":true`) || !strings.Contains(body, `"window":{"from":"2026-10-01"`) {
 			t.Fatalf("verify: %d %s", resp.StatusCode, body)
 		}
+		_, metrics := e.do(t, "GET", "/metrics", "", nil)
+		for _, want := range []string{"recond_windowed_runs_total 1", "recond_last_run_window_days 2", "recond_last_run_outside_window 0",
+			`recond_last_run_window_records{record="ledger",scope="window"}`, `recond_last_run_window_records{record="line",scope="margin"}`,
+			"recond_last_run_window_groups_not_owned "} {
+			if !strings.Contains(metrics, want) {
+				t.Errorf("metrics lack %q", want)
+			}
+		}
+		// A full run resets the last-run window gauges.
+		if resp, _ := e.do(t, "POST", "/v1/runs", fmt.Sprintf(`{"as_of":%q}`, asOf), auth); resp.StatusCode != http.StatusCreated {
+			t.Fatal(resp.StatusCode)
+		}
+		_, metrics = e.do(t, "GET", "/metrics", "", nil)
+		if !strings.Contains(metrics, "recond_last_run_window_days 0") || strings.Contains(metrics, "recond_last_run_window_records{") ||
+			!strings.Contains(metrics, "recond_windowed_runs_total 1") {
+			t.Fatal("full run must reset the last-run window gauges")
+		}
 	})
 }

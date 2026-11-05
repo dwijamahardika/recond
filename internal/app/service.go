@@ -32,6 +32,9 @@ type Metrics interface {
 	Webhook(provider, result string)
 	Ingested(kind string, rows int)
 	RunFinished(d time.Duration, counts map[domain.Class]int)
+	// RunWindow follows RunFinished: w is nil for a full-history run;
+	// outside counts outside_window groups by provider.
+	RunWindow(w *WindowSummary, outside map[string]int)
 	ExceptionsOpen(n int)
 }
 
@@ -40,6 +43,7 @@ type noMetrics struct{}
 func (noMetrics) Webhook(string, string)                          {}
 func (noMetrics) Ingested(string, int)                            {}
 func (noMetrics) RunFinished(time.Duration, map[domain.Class]int) {}
+func (noMetrics) RunWindow(*WindowSummary, map[string]int)        {}
 func (noMetrics) ExceptionsOpen(int)                              {}
 
 // Service is the application layer used by the CLI and the HTTP API.
