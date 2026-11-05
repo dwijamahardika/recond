@@ -389,7 +389,7 @@ func TestAttachIsAmortised(t *testing.T) {
 	for i := 0; i < n; i++ {
 		ref := fmt.Sprintf("ORD-%05d", i)
 		ledger = append(ledger, led("t"+ref, "bank_b", ref, 1_000_000, day7))
-		lines = append(lines, itemB("L"+ref, ref, 1_000_000, time.Time{}, d(11)),        // dated 11 Oct: beyond the lookahead
+		lines = append(lines, itemB("L"+ref, ref, 1_000_000, time.Time{}, d(11)), // dated 11 Oct: beyond the lookahead
 			itemA("V"+ref, "OTHER-"+ref, 1_000_000, day7, d(8), -1), itemA("W"+ref, "MORE-"+ref, 1_000_000, day7, d(8), -1))
 	}
 	visible := lines[:0:0]
