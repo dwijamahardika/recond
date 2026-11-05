@@ -8,7 +8,7 @@
 
 ## 1. Summary
 
-A run can be given a **window**: an inclusive range of business dates `[from, to]` and two margins, `lookbehind` and `lookahead`, in days. The run loads only records whose *window date* falls in `[from − lookbehind, to + lookahead]` (the **visible range**). It matches them with the unchanged engine and **reports only the groups whose earliest record is dated inside `[from, to]`**. If a record in the window cannot be paired because its counterpart lies outside the visible range, the run does not call it missing. It classifies it `outside_window` and attaches the counterpart. The window is stored on the run, `verify` replays it, and the exception queue is scoped so that a run over one week cannot auto-close another week's exceptions. The feature ships behind `RECOND_WINDOWED_RUNS` (default off).
+A run can be given a **window**: an inclusive range of business dates `[from, to]` and two margins, `lookbehind` and `lookahead`, in days. The run loads only records whose *window date* falls in `[from − lookbehind, to + lookahead]` (the **visible range**). It matches them with the unchanged engine and **reports only the groups whose earliest record is dated inside `[from, to]`**. If a record cannot be paired because its counterpart lies outside the visible range, the run does not call it missing. It classifies it `outside_window`, attaching the counterpart when the reference is unique, and keeps it out of the later passes as a full run would. The window is stored on the run, `verify` replays it, and the exception queue is scoped so that a run over one week cannot auto-close another week's exceptions. The feature ships behind `RECOND_WINDOWED_RUNS` (default off).
 
 ## 2. How a run works today
 
@@ -45,16 +45,18 @@ Earliest record, because it is a simple total rule every window computes the sam
 
 ## 5. Counterpart outside the window: `outside_window`
 
-After ownership, a run looks at the owned groups that the *leftovers* pass produced: a ledger transaction with nothing to pair (`missing_in_settlement` or `awaiting_settlement`) or an itemised line with nothing to pair (`missing_in_ledger`). Each of these is either a real discrepancy or a record whose counterpart exists but is dated outside the visible range. The run asks storage, bounded by the run's file watermark so `verify` asks the same question:
+*Amended during the build. See "Amendment" below.*
 
-- for a ledger transaction: itemised lines of its provider with the same normalised reference, and payouts whose covered period contains its provider time;
-- for an itemised line: ledger transactions of its provider with the same normalised reference.
+A record whose counterpart is dated outside the visible range is not a discrepancy. The run just cannot see the partner. Such records are found in two places, both bounded by the run's file watermark so `verify` asks the same questions:
 
-Candidates dated inside the visible range are ignored: the run already saw them, so they were not the answer. If anything remains, the group becomes **`outside_window`**. That is informational, not a discrepancy, so it opens no exception. Its detail names the counterpart, its date and the visible range ("verdict deferred: widen the margin").
+1. **Right after the reference pass**, every record still unmatched is looked up by normalised reference outside the visible range: itemised lines for a ledger transaction, ledger transactions for an itemised line. The lookups are batched per provider. A record with a partner there would have been taken by a *full* run's reference pass. So it is taken here too: removed from the refunded, tolerance and batch pools, which therefore see exactly what a full run's do. When the reference is **unique on both sides** (exactly one partner, which has no other partner by reference), the partner is **attached** as a member, and the pair is reported as `outside_window` (rule `reference`) under §4's ownership rule. If the partner is *earlier* than the window, the earlier window owns the pair: it reports it with its true verdict when its lookahead reaches, otherwise as the same `outside_window` pair. This run then leaves it.
+2. **After the leftovers pass**, an owned `missing_in_settlement`, `awaiting_settlement` or `missing_in_ledger` record is deferred **on its own** if its reference partner outside the window was ambiguous (step 1 found it but could not attach it), or, for a transaction, if a payout covering its provider time lies outside the visible range.
 
-When the reference is **unique on both sides**, meaning exactly one counterpart, and that counterpart has no other partner by reference, the counterpart record is **attached** to the group as a member, and §4's ownership rule applies to the pair. If the counterpart is *earlier* than the window, the earlier window owns the pair, either with its true verdict (its lookahead reached) or as the same `outside_window` pair, so this run leaves it. When the reference is ambiguous or the counterpart is a payout, the record is deferred on its own.
+Candidates dated inside the visible range are ignored: the run already saw them. `outside_window` is informational, not a discrepancy, so it opens no exception. Its detail names the counterpart, its date and the visible range, and says which margin to widen.
 
 Rejected alternative: dropping a record whose counterpart is earlier without the uniqueness check. With a reused reference (two ledger rows, one settlement), that drops the second row's real `missing_in_settlement` in every window.
+
+**Amendment (build phase).** The first implementation looked for counterparts only after the leftovers pass. The G2 property test (`TestWindowedRunsDeferWhenMarginTooSmall`) failed on all 12 seed/configuration cases while G1 passed. A bank_b transaction whose untimed late credit lay beyond the lookahead was not consumed by the reference pass, so it fell into its payout's candidate pool, and the subset search had to exclude it again. Members and class were right, but the detail differed from the full run, and with tied amounts the batch could have become a false discrepancy. The cure is to follow pass precedence: the reference pass's view of the world, including partners outside the window, is settled before any later pass runs. Step 1 above is that cure.
 
 ## 6. Guarantees, and exactly when they hold
 
@@ -189,7 +191,7 @@ The existing `recond_last_run_outcomes{class}` is unchanged.
 | Six new indexes slow ingestion | Measured in the rehearsal. Ledger and settlement ingest are a small share of total ingest, which webhooks dominate. |
 | Binary rollback below this release | Windowed runs are stored with their window, but an older binary does not read it: its `verify` replays them unwindowed and reports **MISMATCH** (loud, not silent). Flag rollback is the safe path. The rollout plan says so. |
 | Engine semantics drift between windowed and full | The property test asserts equality with the full run on every seed, plus a golden-digest test for unwindowed runs. |
-| Probe cost on large runs | Probes run only for owned leftovers (tens to hundreds per run), as indexed point lookups. Measured. |
+| Lookup cost on large runs | One batched lookup per provider after the reference pass, covering every record still unmatched. For a payout provider that is almost all of its transactions. Indexed, chunked `IN` queries, measured in the rehearsal. Payout lookups run only for owned leftovers. |
 
 ## 17. Testing (detail in [03-test-plan.md](03-test-plan.md))
 
