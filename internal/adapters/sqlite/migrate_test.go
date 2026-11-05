@@ -52,7 +52,7 @@ func TestMigrationFromSchema0001(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = s.Close() })
 	r, err := s.Run(ctx, 1)
-	if err != nil || r.ResultDigest != "out" || r.LedgerCount != 1 || r.DurationMS != 5 {
+	if err != nil || r.ResultDigest != "out" || r.LedgerCount != 1 || r.DurationMS != 5 || r.Window != nil {
 		t.Fatalf("pre-existing run: %+v %v", r, err)
 	}
 	var from, date any

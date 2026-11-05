@@ -259,6 +259,9 @@ type Run struct {
 	PaymentCount  int       `json:"payment_count"`
 	SummaryJSON   string    `json:"-"`
 	DurationMS    int64     `json:"duration_ms"`
+	// Window is what a windowed run reconciled; nil means the whole history
+	// (every run made before windowed runs existed).
+	Window *match.Window `json:"window,omitempty"`
 }
 
 // ExceptionSync summarises how a run changed the exception queue.
@@ -268,6 +271,10 @@ type ExceptionSync struct {
 	AutoClosed int `json:"auto_closed"`
 	StillOpen  int `json:"still_open"`
 	Resolved   int `json:"already_resolved"`
+	// KeptDeferred counts open exceptions in a windowed run's window that it
+	// did not see but did not auto-close either, because their records are
+	// in a group it deferred as outside_window: no verdict yet.
+	KeptDeferred int `json:"kept_open_deferred,omitempty"`
 }
 
 // SaveRun persists a run, its outcomes and members, and syncs the exception
@@ -278,11 +285,17 @@ func (s *Store) SaveRun(ctx context.Context, r Run, res *match.Result, evidence 
 	err := s.writeTx(ctx, func(tx *sql.Tx) error {
 		now := s.now()
 		r.CreatedAt = now
+		var wFrom, wTo, wBehind, wAhead any // NULL: full history
+		if w := r.Window; w != nil {
+			wFrom, wTo, wBehind, wAhead = w.From.String(), w.To.String(), w.Lookbehind, w.Lookahead
+		}
 		x, err := tx.ExecContext(ctx, `INSERT INTO runs (created_at, as_of, engine_version, config_json, config_sha256, max_file_id, max_event_seq,
-			input_digest, result_digest, ledger_count, line_count, payment_count, summary_json, duration_ms)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			input_digest, result_digest, ledger_count, line_count, payment_count, summary_json, duration_ms,
+			window_from, window_to, window_lookbehind, window_lookahead)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			now.UnixNano(), r.AsOf.UnixNano(), r.EngineVersion, r.ConfigJSON, r.ConfigSHA256, r.MaxFileID, r.MaxEventSeq,
-			r.InputDigest, r.ResultDigest, r.LedgerCount, r.LineCount, r.PaymentCount, r.SummaryJSON, r.DurationMS)
+			r.InputDigest, r.ResultDigest, r.LedgerCount, r.LineCount, r.PaymentCount, r.SummaryJSON, r.DurationMS,
+			wFrom, wTo, wBehind, wAhead)
 		if err != nil {
 			return err
 		}
@@ -345,18 +358,34 @@ func (s *Store) SaveRun(ctx context.Context, r Run, res *match.Result, evidence 
 }
 
 const runCols = `id, created_at, as_of, engine_version, config_json, config_sha256, max_file_id, max_event_seq, input_digest, result_digest,
-	ledger_count, line_count, payment_count, summary_json, duration_ms`
+	ledger_count, line_count, payment_count, summary_json, duration_ms, window_from, window_to, window_lookbehind, window_lookahead`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var r Run
 	var created, asOf int64
+	var wFrom, wTo sql.NullString
+	var wBehind, wAhead sql.NullInt64
 	err := sc.Scan(&r.ID, &created, &asOf, &r.EngineVersion, &r.ConfigJSON, &r.ConfigSHA256, &r.MaxFileID, &r.MaxEventSeq,
-		&r.InputDigest, &r.ResultDigest, &r.LedgerCount, &r.LineCount, &r.PaymentCount, &r.SummaryJSON, &r.DurationMS)
-	r.CreatedAt, r.AsOf = fromNanos(created), fromNanos(asOf)
+		&r.InputDigest, &r.ResultDigest, &r.LedgerCount, &r.LineCount, &r.PaymentCount, &r.SummaryJSON, &r.DurationMS,
+		&wFrom, &wTo, &wBehind, &wAhead)
 	if errors.Is(err, sql.ErrNoRows) {
-		err = ErrNotFound
+		return r, ErrNotFound
 	}
-	return r, err
+	if err != nil {
+		return r, err
+	}
+	r.CreatedAt, r.AsOf = fromNanos(created), fromNanos(asOf)
+	if wFrom.Valid {
+		w := &match.Window{Lookbehind: int(wBehind.Int64), Lookahead: int(wAhead.Int64)}
+		if err := w.From.UnmarshalText([]byte(wFrom.String)); err != nil {
+			return r, fmt.Errorf("run %d window: %w", r.ID, err)
+		}
+		if err := w.To.UnmarshalText([]byte(wTo.String)); err != nil {
+			return r, fmt.Errorf("run %d window: %w", r.ID, err)
+		}
+		r.Window = w
+	}
+	return r, nil
 }
 
 // Run returns a run; id 0 means the latest.
